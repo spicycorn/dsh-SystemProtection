@@ -26,6 +26,16 @@ Two audiences need different sentences, and what the plugin may do for each is d
 
 **The model** gets one static section registered through `ctx.systemPrompt.section()` at order 3120 — after the tool sections, well before the persona suffix: the limits, an explicit ban on routing around a block, and the requirement to write the reason *before* the call. The text is static because the assembled prompt is committed as a surface node and replaced only when the text changes. `modelGuidance: false` drops the section, and a profile that provides no `systemPrompt` service logs a warning and enforces anyway.
 
+## How 1.0.0 got its fixes
+
+Every one of these was measured on a second machine, not imagined, and each one is a test now.
+
+- **The install directory was unprotected.** Its location came only from `DSH_INSTALL_DIR` / `DSH_NODE_EXECUTABLE`, which a launcher exports for the *tool subprocesses* it spawns; the process running the plugin had neither. A packaged app is now read from inside itself — `process.versions.electron` with `execPath` and `resourcesPath`. The inference is refused for a plain `node` (which would make every write under `C:\Program Files\nodejs` a denial) and for a drive root, and it climbs `.app/Contents/{MacOS,Resources}` to the bundle.
+- **`Get-Date | Format-Table` was denied as erasing a volume**, because the blanket table was matched by hyphen prefix. Blanket entries are matched exactly now; `Format-Volume` and `mkfs.ext4` still land.
+- **A path one assignment away passed** — `$p = 'C:\…\.git\config'; Remove-Item -LiteralPath $p`. Literals the command assigns to its own variables are resolved, and the verdict notes record which variable was resolved to what, so a denial can be checked rather than trusted.
+
+Attacking the fixed build then found two more that the report had not mentioned: `rm -rf /*` was judged as the glob rather than as the root, and `-LiteralPath C:\` lost its operand entirely because the tokenizer applied POSIX backslash escaping to PowerShell, where `\` is an ordinary character. Both are pinned as well, along with the negative controls that keep `rm -rf ./out/*` a normal cleanup.
+
 ## What the plugin never does
 
 - It never deletes, moves, or rewrites anything itself. The only file it may write is an audit log you configure.

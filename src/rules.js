@@ -295,10 +295,13 @@ export function classifyKey(input, ctx, extra = {}) {
       // `harness:self` exists so a model cannot delete the protection plugin to
       // switch itself off. When the plugin *is* inside the session workspace — a
       // `link:` install someone is developing — that same rule would deny every
-      // ordinary edit in the tree, so the developer's own tree wins. Real
-      // installs stay protected: they live under the profile, covered by
-      // `harness:profile`, and a plugin cannot be installed without a person.
-      if (rule.id === 'harness:self' && sessionRoot !== undefined && isWithin(sessionRoot, rule.key, ctx)) continue
+      // ordinary edit in the tree, so the developer's own tree wins. The same
+      // principle covers every harness root, the application directory included:
+      // a person who chose a workspace containing the Harness, `~/.dsh`, or the
+      // profile means to work there, and no rule of this plugin can talk them out
+      // of it. `system`, `credentials`, and `versionControl` never yield — a
+      // workspace that happens to contain `C:\Windows` still cannot delete it.
+      if (rule.id.startsWith('harness:') && sessionRoot !== undefined && isWithin(sessionRoot, rule.key, ctx)) continue
       if (rule.except !== undefined && rule.except.some(exceptKey => isWithin(exceptKey, probe, ctx))) continue
       const depth = depthBelow(rule.key, probe, ctx)
       if (depth < 0) continue

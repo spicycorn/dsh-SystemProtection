@@ -136,7 +136,11 @@ export function splitSegments(text, dialect) {
       current += char
       continue
     }
-    if (char === '\\' && next !== undefined && dialect !== 'cmd') {
+    // Same rule as in `tokenize`: only POSIX escapes with backslash. PowerShell
+    // escapes with the backtick (handled below) and cmd with `^`. Letting `\`
+    // escape here glued `$d = C:\; Remove-Item $d` into one segment, so the
+    // assignment was never seen and the wipe of a whole drive passed.
+    if (char === '\\' && next !== undefined && dialect !== 'cmd' && dialect !== 'ps') {
       current += char + next
       index++
       continue
@@ -222,7 +226,11 @@ export function tokenize(segment, dialect) {
       raw += char
       continue
     }
-    if (char === '\\' && dialect !== 'cmd' && escapesNext(next)) {
+    // Only POSIX uses backslash as an escape character when unquoted. PowerShell
+    // escapes with the backtick and cmd with `^`, so treating `\` as an escape in
+    // those dialects swallowed the space after `Remove-Item -LiteralPath C:\` and
+    // left a path with a trailing space — which no rule could then recognise.
+    if (char === '\\' && dialect !== 'cmd' && dialect !== 'ps' && escapesNext(next)) {
       buffer += next
       raw += char + next
       index++
@@ -422,7 +430,11 @@ export function scanCommand(options) {
   for (const entry of texts) {
     if (texts.length > 1) notes.push(`decoded ${entry.via}`)
     let runningCwd = cwd
-    for (const segment of splitSegments(entry.text, entry.dialect)) {
+    /** Literals this command assigned to its own variables, in source order. */
+    const vars = new Map()
+    for (const source of splitSegments(entry.text, entry.dialect)) {
+      const segment = expandAssigned(source, vars, entry.dialect, notes)
+      recordAssignment(segment, vars, entry.dialect)
       scanSegment({ segment, dialect: entry.dialect, cwd: runningCwd, ctx, sessionRoot, findings, notes, fs: options.fs, resolveSymlinksInsideWorkspace: options.resolveSymlinksInsideWorkspace, protectWrites })
       // `cd /etc && rm passwd` — relative operands after a cd are resolved there.
       const moved = cdTarget(segment, entry.dialect, runningCwd, ctx)
@@ -478,12 +490,101 @@ const READ_ONLY_VERBS = new Set([
   'pwd', 'cd', 'set', 'export', 'alias', 'test', 'true', 'false', 'sleep', 'comment', 'date', 'hostname', 'env', 'printenv',
 ])
 
+/**
+ * A command that damages the machine whatever its arguments name.
+ *
+ * Matched **exactly**. The hyphen-prefix form was there to catch PowerShell
+ * cmdlets, but every cmdlet worth naming is spelled out in `BLANKET`, and the
+ * prefix rule also matched `Format-Table` against `format` — so
+ * `Get-Date | Format-Table` was denied as if it erased a volume. Measured, not
+ * theorised. `mkfs` is the one family with a legitimate suffix spelling
+ * (`mkfs.ext4`, `mkfs.btrfs`).
+ */
+function blanketHit(verb) {
+  return BLANKET.find(candidate => candidate.verb === verb
+    || (candidate.verb === 'mkfs' && verb.startsWith('mkfs.')))
+}
+
 /** Is this verb one that can change or remove files? */
 function isMutationVerb(verb) {
   if (verb === '') return false
   if (verb === 'git') return true
   return POSIX_DELETE.has(verb) || WIN_DELETE.has(verb) || POSIX_MOVE.has(verb) || WIN_MOVE.has(verb)
-    || WIN_WRITE.has(verb) || POSIX_TRUNCATE.has(verb) || BLANKET.some(candidate => candidate.verb === verb || verb.startsWith(`${candidate.verb}-`))
+    || WIN_WRITE.has(verb) || POSIX_TRUNCATE.has(verb) || blanketHit(verb) !== undefined
+}
+
+/**
+ * A path built one step away from the command text used to pass:
+ * `$p = 'C:\…\.git\config'; Remove-Item -LiteralPath $p`. Only a path written
+ * out in the text was judged, so this resolves what the command *it itself*
+ * assigned as a literal string.
+ *
+ * What it deliberately does not claim: `iex $a`, `& $p`, a value from
+ * `Read-Host`, a payload fetched at runtime, or a variable set by an earlier
+ * call. Text cannot be evaluated the way a shell evaluates it, and pretending
+ * otherwise would be a false promise. What closes those is the file-system seam
+ * for tools that go through the Host, and the sandbox for everything else.
+ */
+const ASSIGN_PS = /^\s*\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?\s*\+?=\s*(.*)$/
+const ASSIGN_SH = /^(?:export\s+|local\s+|readonly\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/
+const QUOTED_RE = /'([^'\n]*)'|"([^"\n]*)"/g
+const BAREWORD_PATH_RE = /^(?:[A-Za-z]:[\\/]|[/\\])[^\s;|&`]*$|^(?:~|\.{1,2})[/\\][^\s;|&`]*$|^~$/
+/** Not a value yet: composition, substitution, a prompt, a pipeline. */
+const DYNAMIC_RE = /[$`|(]/
+
+const literalValues = value => {
+  const trimmed = value.trim()
+  if (trimmed === '' || DYNAMIC_RE.test(trimmed)) return []
+  const quoted = [...trimmed.matchAll(QUOTED_RE)]
+  if (quoted.length > 0) {
+    // `Read-Host 'path'` and `Join-Path $a 'b'` are calls with a quoted argument,
+    // not an assignment of that string — a cmdlet name left over after stripping
+    // the quotes means this right-hand side is not nothing-but-literals.
+    if (trimmed.replace(QUOTED_RE, '').trim() !== '') return []
+    const parts = quoted.map(match => match[1] ?? match[2] ?? '').filter(entry => entry !== '')
+    return parts.length > 0 && parts.length <= 3 ? parts : []
+  }
+  return BAREWORD_PATH_RE.test(trimmed) ? [trimmed] : []
+}
+
+/** Note the literal a command assigns to its own variable, for later segments. */
+function recordAssignment(segment, vars, dialect) {
+  const match = (dialect === 'ps' ? ASSIGN_PS : ASSIGN_SH).exec(segment)
+  if (match === null) return
+  const values = literalValues(match[2])
+  if (values.length !== 1) return
+  const name = dialect === 'ps' ? match[1].toLowerCase() : match[1]
+  vars.set(name, values[0])
+}
+
+/**
+ * Re-quote a resolved value so the tokenizer still sees one operand.
+ * Single quotes are literal in both shells. Double quotes are never used here:
+ * a value ending in `\` would escape the closing quote and merge every later
+ * token into one.
+ */
+const quoteFor = value => {
+  if (!/['"]/.test(value)) return `'${value}'` // literal in both shells
+  if (!/\s/.test(value)) return value // a bareword path needs no quoting
+  return undefined // cannot be rebuilt safely: leave it unresolved and say so
+}
+
+/** Replace `$name` with the literal assigned earlier in the same command. */
+function expandAssigned(segment, vars, dialect, notes) {
+  if (vars.size === 0) return segment
+  const fold = dialect === 'ps' ? (/** @param {string} name */ name) => name.toLowerCase() : (/** @param {string} name */ name) => name
+  // Single quotes are literal in both shells, so `rm '$p'` names a file called `$p`.
+  return segment.split(/('[^']*')/g).map((part, index) => {
+    if (index % 2 === 1 || !part.includes('$')) return part
+    return part.replace(/\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/g, (whole, name) => {
+      const value = vars.get(fold(name))
+      if (value === undefined) return whole
+      const note = `resolved $${name} = ${value} from the same command`
+      if (!notes.includes(note)) notes.push(note)
+      const quoted = quoteFor(value)
+      return quoted ?? whole
+    })
+  }).join('')
 }
 
 /** One `verb …operands` command segment. */
@@ -513,7 +614,7 @@ function scanSegment({ segment, dialect, cwd, ctx, sessionRoot, findings, notes,
   }
   const args = tokens.slice(index + 1)
 
-  const blanket = BLANKET.find(candidate => candidate.verb === verb || verb.startsWith(`${candidate.verb}-`))
+  const blanket = blanketHit(verb)
   if (blanket !== undefined) {
     findings.push({ tier: blanket.tier, id: blanket.id, verb, path: undefined, raw: verbToken.text, note: blanket.note })
   }
@@ -664,7 +765,15 @@ function classifyOperand({ raw, alt, cwd, ctx, sessionRoot, verb, via, fs, resol
 
     const wildcard = isWildcardOperand(expanded.text)
     const trimmed = absolute.replace(/[/\\](?:\*{1,2}|\*\*)$/, '')
-    const probe = trimmed === '' ? absolute : trimmed
+    // `rm -rf /*` deletes the contents of the root, so it must be judged *as* the
+    // root: a glob is not an ancestor of any rule, so falling back to the
+    // untrimmed `/*` let the widest possible wipe through. A relative `*` is left
+    // as it is, resolved inside the workspace where it lives.
+    let probe = trimmed
+    if (probe === '') {
+      const rooted = /^([A-Za-z]:[/\\]|[/\\])/.test(absolute)
+      probe = !rooted ? absolute : (ctx.win ? `${absolute.slice(0, 1)}:\\` : ctx.path.sep)
+    }
 
     let real
     if (fs !== undefined) {

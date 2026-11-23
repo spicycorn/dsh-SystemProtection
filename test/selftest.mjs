@@ -322,6 +322,177 @@ for (const command of ['rm -n /etc/passwd', 'rm -r /usr/lib', 'rm -f /etc/shadow
   passed += 1
 }
 
+// ── The three field findings (2026-11-23, second machine, clean environment) ─
+// Every probe below is one the tester ran against the installed plugin. They are
+// pinned here so none of them can come back silently.
+const decideWin = (command, context = win) => decideToolCall({
+  name: 'pwsh',
+  args: { command },
+  ctx: context,
+  sessionRoot: WIN_CWD,
+  tierActions: DEFAULT_TIERS,
+  protectWrites: true,
+  scanShell: true,
+  genericPathSweep: true,
+  resolveSymlinksInsideWorkspace: false,
+})
+const decideNix = command => decideToolCall({
+  name: 'bash',
+  args: shell(command),
+  ctx: nix,
+  sessionRoot: NIX_CWD,
+  tierActions: DEFAULT_TIERS,
+  protectWrites: true,
+  scanShell: true,
+  genericPathSweep: true,
+  resolveSymlinksInsideWorkspace: false,
+})
+
+// Finding 1 — the application directory was unprotected whenever the launcher
+// exported nothing. A packaged desktop app names its own install from inside the
+// process, so a clean environment can no longer mean "no rule for the app".
+const cleanEnv = Object.fromEntries(Object.entries(win.env).filter(([key]) => !key.startsWith('DSH_')))
+const packaged = createSystemContext({
+  ...snapshotOf(win),
+  env: cleanEnv,
+  runtime: {
+    execPath: 'D:\\DeepSeek Harness\\DeepSeek Harness.exe',
+    resourcesPath: 'D:\\DeepSeek Harness\\resources',
+    versions: { electron: '33.4.5' },
+  },
+})
+assert.equal(packaged.roots.installDirs.includes('d:\\deepseek harness'), true, `installDirs: ${JSON.stringify(packaged.roots.installDirs)}`)
+passed += 1
+for (const command of [
+  'Remove-Item \'D:\\DeepSeek Harness\\DeepSeek Harness.exe\'',
+  'Remove-Item -LiteralPath "D:\\DeepSeek Harness\\resources\\app.asar"',
+  'del /f /s /q "D:\\DeepSeek Harness\\resources"',
+]) {
+  assert.equal(decideWin(command, packaged).action, 'deny', `${command} must be denied without any DSH_* env`)
+  passed += 1
+}
+
+// ...and the same inference must not fire for a plain `node`: an install dir
+// inferred from the wrong executable would deny every write under it.
+const cliNode = createSystemContext({
+  ...snapshotOf(win),
+  env: cleanEnv,
+  runtime: { execPath: 'D:\\tools\\node\\node.exe', versions: {} },
+})
+assert.equal(decideWin('Remove-Item -Recurse -Force D:\\tools\\node\\node_modules\\npm', cliNode).action, 'allow', 'a plain node.exe must not make its whole tree the Harness install')
+passed += 1
+
+const macApp = createSystemContext({
+  platform: 'darwin',
+  homedir: '/Users/tester',
+  cwd: '/tmp/work',
+  env: { HOME: '/Users/tester' },
+  runtime: {
+    execPath: '/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness',
+    resourcesPath: '/Applications/DeepSeek Harness.app/Contents/Resources',
+    versions: { electron: '33.4.5' },
+  },
+})
+assert.equal(decideNix('rm -rf "/Applications/DeepSeek Harness.app"').action === 'allow'
+  && decideToolCall({
+    name: 'bash',
+    args: shell('rm -rf "/Applications/DeepSeek Harness.app"'),
+    ctx: macApp,
+    sessionRoot: '/tmp/work',
+    tierActions: DEFAULT_TIERS,
+    protectWrites: true,
+    scanShell: true,
+    genericPathSweep: true,
+    resolveSymlinksInsideWorkspace: false,
+  }).action, 'deny', 'the .app bundle, not its Contents/MacOS directory, is the install')
+passed += 1
+
+// Finding 3 — `Get-Date | Format-Table` was denied as if it erased a volume,
+// because `format-table` starts with `format-`. Read-only formatters are allowed;
+// the cmdlets that actually destroy a volume are still matched by full name.
+for (const command of [
+  'Get-Date | Format-Table',
+  'Get-Process | Format-List Name',
+  'Get-Service | Format-Wide',
+  'Get-ChildItem . | Format-Custom',
+  'Get-Date | Out-String',
+]) {
+  assert.equal(decideWin(command).action, 'allow', `${command} only prints`)
+  passed += 1
+}
+assert.equal(decideWin('Format-Volume -DriveLetter D').action, 'deny', 'Format-Volume erases a volume')
+passed += 1
+assert.equal(decideNix('mkfs.ext4 /dev/sdb').action, 'deny', 'mkfs keeps its suffix spellings')
+passed += 1
+
+// Finding 2 — a path one assignment away from the text passed, because only a
+// literal path was judged. Literals the command assigns to its own variables are
+// now resolved; what a shell can build and text cannot is pinned as allowed so a
+// future change to it is a decision, not a surprise.
+for (const command of [
+  '$p = \'C:\\Users\\spicy\\.git\\config\'; Remove-Item -LiteralPath $p',
+  '$target = C:\\Windows\\System32\\drivers\\etc\\hosts; Remove-Item $target',
+  '$x = "C:\\Windows\\System32\\config"; Remove-Item -Recurse -Force $x',
+  '${dir} = \'C:\\Users\\spicy\\.ssh\'; Remove-Item -Recurse -Force $dir',
+]) {
+  assert.equal(decideWin(command).action, 'deny', `${command} hides a protected path behind a variable`)
+  passed += 1
+}
+assert.equal(decideNix('p=/etc/passwd; rm -f $p').action, 'deny', 'a sh assignment is a literal too')
+passed += 1
+assert.equal(decideWin('Remove-Item -LiteralPath \'$p\'').action, 'allow', "single quotes are literal: '$p' is a file named $p")
+passed += 1
+// The honest gap, pinned so it stays visible in the test output.
+const runtimeBuilt = decideWin('$p = Read-Host \'path\'; Remove-Item -Recurse -Force $p')
+assert.equal(runtimeBuilt.action, 'allow', 'a value built at runtime cannot be read from text (documented gap)')
+passed += 1
+// ...and the prompt text of `Read-Host` is not the variable's value: inventing a
+// resolution is worse than admitting one, because it manufactures false denials.
+for (const [command, label] of [
+  ['$p = Read-Host \'C:\\Windows\'; Remove-Item -Recurse -Force $p', 'Read-Host prompt text is not a value'],
+  ['$f = Get-ChildItem \'C:\\Windows\\System32\\config\'; Remove-Item $f', 'a cmdlet argument is not an assignment'],
+]) {
+  const verdict = decideWin(command)
+  assert.equal(verdict.notes?.some(note => String(note).startsWith('resolved $')), false, `${label}: ${JSON.stringify(verdict.notes)}`)
+  passed += 1
+}
+
+// An app sitting directly on a drive root would otherwise make the whole volume
+// "the install" — a false positive far worse than the miss it trades for.
+const driveRoot = createSystemContext({
+  ...snapshotOf(win),
+  env: cleanEnv,
+  runtime: { execPath: 'D:\\DeepSeek Harness.exe', resourcesPath: 'D:\\resources', versions: { electron: '33.4.5' } },
+})
+assert.equal(driveRoot.roots.installDirs.some(dir => /^d:\\?$/.test(dir)), false, `installDirs: ${JSON.stringify(driveRoot.roots.installDirs)}`)
+assert.equal(decideWin('Remove-Item -Recurse -Force D:\\work\\project\\src\\index.js', driveRoot).action, 'allow', 'a drive root is never inferred as the install')
+passed += 2
+
+// The widest wipe of all, and the same shape on Windows. Both were found only by
+// attacking the fixed build: `/*` used to fall back to judging the glob itself,
+// and `-LiteralPath C:\` lost its operand to a backslash that PowerShell does not
+// even treat as an escape.
+for (const [command, decide, label] of [
+  ['rm -rf /*', decideNix, 'the contents of the root are the root'],
+  ['rm -rf ~/*', decideNix, 'the contents of home are home'],
+  ['rm -rf /', decideNix, 'the root itself'],
+  ['Remove-Item -LiteralPath C:\\ -Recurse -Force', decideWin, 'a whole volume, spelled the PowerShell way'],
+  ['$d = C:\\; Remove-Item -Recurse -Force $d', decideWin, 'a volume in a variable, unquoted'],
+  ['$d = \'C:\\\'; Remove-Item -Recurse -Force $d', decideWin, 'a volume in a variable, quoted'],
+]) {
+  assert.equal(decide(command).action, 'deny', `${label}: ${command}`)
+  passed += 1
+}
+// The fallback above must not over-reach: a glob in the workspace is still a glob.
+for (const command of ['rm -rf ./out/*', 'rm -rf build/*']) {
+  assert.equal(decideNix(command).action, 'allow', `${command} is workspace cleanup`)
+  passed += 1
+}
+for (const command of ['Remove-Item .\\dist\\*', 'Remove-Item -Recurse -Force .\\node_modules\\*']) {
+  assert.equal(decideWin(command).action, 'allow', `${command} is workspace cleanup`)
+  passed += 1
+}
+
 console.log(`system-protection selftest: ${passed} checks passed, ${failures.length} failed`)
 for (const failure of failures) console.error(`FAIL ${failure}`)
 if (failures.length > 0) process.exitCode = 1

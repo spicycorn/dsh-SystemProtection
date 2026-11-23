@@ -26,6 +26,16 @@
 
 **模型** 这一侧：通过 `ctx.systemPrompt.section()` 注册一段静态内容，order 3120 —— 排在工具说明之后、persona 后缀之前 —— 内容是这些边界、明确禁止绕路，以及要求它在发起调用之前先把理由写出来。文本保持静态，是因为装配好的提示词会作为 surface node 落进会话，只有文本变化才会替换。`modelGuidance: false` 就不注册；如果这个 profile 没有提供 `systemPrompt` 服务，插件会 warn 一句然后照常拦截。
 
+## 1.0.0 的修是怎么来的
+
+下面每一条都是在第二台机器上实测出来的，不是推想出来的，而且每一条现在都有测试钉住。
+
+- **安装目录没被保护。** 它的位置只来自 `DSH_INSTALL_DIR` / `DSH_NODE_EXECUTABLE`，而这两个变量是启动器为它派生的*工具子进程*准备的；跑插件的那个进程两个都没有。打包桌面应用现在从自身内部读取——`process.versions.electron` 配上 `execPath` 与 `resourcesPath`。这个推断对普通 `node` 会拒绝采用（否则 `C:\Program Files\nodejs` 底下的每次写入都会变成拦截），对盘符根也会拒绝；macOS 下会从 `.app/Contents/{MacOS,Resources}` 上溯到 bundle。
+- **`Get-Date | Format-Table` 被当成"格式化卷"拦下**，原因是黑名单是按连字符前缀匹配的。现在黑名单只精确匹配；`Format-Volume`、`mkfs.ext4` 照样拦得住。
+- **隔一层赋值的写法能绕过**——`$p = 'C:\…\.git\config'; Remove-Item -LiteralPath $p`。现在命令自己赋给变量的字面量会被展开，而且判决的 notes 会记下"哪个变量展开成了什么"，于是一次拦截是可以被复核的，不是只能被信任。
+
+拿着修好的版本再打一遍，又翻出报告里没有的两条：`rm -rf /*` 当时是按"一个通配符"判的，而不是按"根目录"判的；`-LiteralPath C:\` 的运算数整个丢了，因为分词器对 PowerShell 用了 POSIX 的反斜杠转义，而在那里 `\` 只是普通字符。这两条同样有测试，连同反向对照——`rm -rf ./out/*` 必须仍然只是清理工作区。
+
 ## 插件绝对不会做的事
 
 - 它自己从不删除、移动或改写任何文件；唯一可能写入的是你自行配置的审计日志。

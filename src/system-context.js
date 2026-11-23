@@ -66,6 +66,8 @@ export function createSystemContext(options = {}) {
   const platform = options.platform ?? process.platform
   const family = platformFamily(platform)
   const env = options.env ?? process.env
+  /** Injectable for tests: the process facts this module reads about itself. */
+  const runtime = options.runtime ?? process
   const homedir = options.homedir ?? os.homedir()
   // Every rule, key and join below must follow the *target* platform's rules,
   // not the host's: a Linux workspace inspected from Windows still uses `/`.
@@ -87,6 +89,12 @@ export function createSystemContext(options = {}) {
     nonEmpty(env.DSH_INSTALL_DIR),
     // `<install>/DeepSeek Harness.exe` (Windows) or `<app>/Contents/MacOS/<exe>` (macOS).
     nonEmpty(env.DSH_NODE_EXECUTABLE) !== undefined ? pathModule.dirname(nonEmpty(env.DSH_NODE_EXECUTABLE)) : undefined,
+    // The two variables above are a favour from a launcher that knows itself. A
+    // packaged desktop app needs no favour: its own executable and Electron's
+    // resources directory name the install from inside the very process running
+    // this plugin. Without this fallback, a machine with a clean environment had
+    // no rule at all for its own application directory — measured, not theorised.
+    ...runtimeAppDirs(runtime, pathModule),
   ].filter(Boolean)
   const installDirs = [...new Set(installCandidates.map(dir => pathKey(dir, { insensitive, path: pathModule })))]
 
@@ -141,4 +149,44 @@ export function createSystemContext(options = {}) {
     && isWithin(ctx.roots.cwd, selfKey, ctx)
 
   return ctx
+}
+
+/**
+ * The application directory of a packaged desktop app, read from the running
+ * process rather than from a launcher's kindness.
+ *
+ * `process.versions.electron` is what makes this safe to act on: without it,
+ * `process.execPath` is whichever `node` happened to start us, and treating
+ * `C:\Program Files\nodejs` or an nvm tree as "the Harness install" would turn
+ * every `npm install` under it into a denial. A CLI binary carrying the
+ * product's own name is the only other case worth trusting.
+ *
+ * @param {{ execPath?: string, resourcesPath?: string, versions?: { electron?: string } }} runtime
+ * @returns {string[]} zero or more candidate install directories
+ */
+function runtimeAppDirs(runtime, pathModule) {
+  const exec = nonEmpty(runtime?.execPath)
+  if (exec === undefined) return []
+  const packaged = runtime?.versions?.electron !== undefined
+  if (!packaged && !/deepseek|dsh/i.test(pathModule.basename(exec))) return []
+  const dirs = [pathModule.dirname(exec)]
+  const resources = nonEmpty(runtime?.resourcesPath)
+  if (resources !== undefined) dirs.push(resources)
+  // A drive root or `/` as the "install" would protect an entire volume, which
+  // is a false positive of a different class than the miss this rule closes.
+  return [...new Set(dirs.map(dir => appRootOf(dir, pathModule)))]
+    .filter(dir => dir !== undefined && dir !== pathModule.sep && !/^[A-Za-z]:[/\\]?$/.test(dir))
+}
+
+/** Climb from an executable or a `resources` directory to the directory that *is* the install. */
+function appRootOf(dir, pathModule) {
+  let at = dir
+  if (at === undefined || at === '') return undefined
+  // Electron:   <install>/resources            → <install>
+  // macOS app:  <App>.app/Contents/Resources   → <App>.app
+  //             <App>.app/Contents/MacOS/<exe> → <App>.app
+  if (/^(resources|macos)$/i.test(pathModule.basename(at))) at = pathModule.dirname(at)
+  if (/^contents$/i.test(pathModule.basename(at))) at = pathModule.dirname(at)
+  // Climb no further: a root has no meaningful install boundary.
+  return at
 }
