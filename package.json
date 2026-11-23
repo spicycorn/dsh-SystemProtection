@@ -28,6 +28,6 @@
     "node": ">=20"
   },
   "scripts": {
-    "test": "node test/selftest.mjs && node test/fake-host.mjs && node test/no-touch.mjs && node test/perf.mjs"
+    "test": "node test/selftest.mjs && node test/fake-host.mjs && node test/no-touch.mjs && node test/perf.mjs && node test/packaging.mjs"
   }
 }
