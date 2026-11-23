@@ -1,0 +1,50 @@
+# Mounted by the bundle installer (Plugins > Add plugin, or plugin_manager install_bundle).
+#
+# Every value below is optional: the plugin ships working defaults, and an empty
+# config means "system, harness, credentials, .git, trash, the home directory and
+# the session workspace root can never be deleted or overwritten; user data,
+# AppData and secret files ask first; lockfiles are left alone".
+#
+# To change anything, copy this row into your profile patch file
+# (~/.dsh/profiles/<profile>/cordis.patch.yml on a POSIX home, %USERPROFILE%\.dsh\profiles\<profile>\cordis.patch.yml
+# on Windows) and edit it there. The plugin registers no settings form of its own,
+# so this is the only place to configure it. A matching override replaces the whole `config` object, so
+# list every field you want, not only the changed one.
+#
+# - insert:
+#     - id: system-protection
+#       name: '@local/system-protection'
+#       config:
+#         enabled: true
+#         enforcement: enforce          # enforce | audit (audit only logs)
+#         protectWrites: true           # also guard overwriting a protected file
+#         scanShell: true               # read bash / pwsh command text
+#         genericPathSweep: true        # unknown (MCP) tools whose name writes: check their path args
+#         resolveSymlinksInsideWorkspace: false
+#         exemptTools: ['plugin_manager', 'plugin_market']
+#         sweepTools: []                # force the generic sweep for these tool names
+#         sweepSkipTools: ['myfs_view'] # never sweep these
+#         auditLog: ''                  # absolute path: append one JSON line per decision
+#         denyNote: ''                  # extra sentence added to every denial message
+#         onInternalError: open         # open | closed
+#         messageLocale: auto           # auto | en | zh
+#         modelGuidance: true           # false = never touch the system prompt
+#         tiers:
+#           system: deny
+#           harness: deny
+#           credentials: deny
+#           versionControl: deny
+#           trash: deny
+#           homeRoot: deny
+#           workspaceRoot: deny
+#           userData: ask
+#           appData: ask
+#           secrets: ask
+#           lockfiles: 'off'
+#         protectExtra: ['/srv/build-cache']
+#         allowExtra: ['~/scratch/keys-sandbox']
+
+- insert:
+    - id: system-protection
+      name: '@local/system-protection'
+      config: {}

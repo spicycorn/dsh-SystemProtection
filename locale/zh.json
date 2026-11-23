@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "系统文件保护",
+    "description": "强制拦截任何会删除或覆盖操作系统文件、Harness 自身、凭据私钥或版本控制历史的工具调用；其它不可逆删除则先请求你确认。",
+    "detail": "docs/DETAIL.zh.md"
+  }
+}

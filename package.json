@@ -1,0 +1,33 @@
+{
+  "name": "@local/system-protection",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Hard-blocks tool calls that would delete or overwrite operating-system, Harness, credential, or version-control files.",
+  "license": "MIT",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "src/*.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "docs",
+    "icon.svg",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node test/selftest.mjs && node test/fake-host.mjs && node test/no-touch.mjs && node test/perf.mjs"
+  }
+}

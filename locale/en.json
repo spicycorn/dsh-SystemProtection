@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "System file protection",
+    "description": "Force-blocks any tool call that would delete or overwrite operating-system, Harness, credential, or version-control files, and routes other irreversible deletes through approval.",
+    "detail": "docs/DETAIL.md"
+  }
+}
