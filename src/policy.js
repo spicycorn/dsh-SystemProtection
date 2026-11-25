@@ -13,9 +13,9 @@
  * @module system-protection/policy
  */
 
-import { expandVariables, normalizeAbsolute, stripQuotes } from './paths.js'
+import { expandVariables, normalizeAbsolute, resolveExistingPath, stripQuotes } from './paths.js'
 import { classifyKey, isCoreTier, TIER_LABEL } from './rules.js'
-import { dialectFor, scanCommand } from './shell-scan.js'
+import { dialectFor, scanCodePayload, scanCommand } from './shell-scan.js'
 
 /** Tier severity: the strictest action across all hits wins. */
 const SEVERITY = { allow: 0, off: 0, ask: 1, deny: 2 }
@@ -67,6 +67,32 @@ const SHELL_KEYS = Object.freeze({
 /** Working-directory override a shell tool may carry. */
 const CWD_KEYS = ['workdir', 'cwd', 'working_directory', 'directory']
 
+/**
+ * Tools whose argument is source code, not a command line.
+ *
+ * A `run_code` tool is a shell in disguise: `shutil.rmtree("C:\\Windows")` and
+ * `fs.rmSync("C:\\Windows")` never reach the shell scanner, and the generic
+ * sweep only reads arguments that look like paths. The code is read as code —
+ * file-API calls and literal `exec("…")` strings — never as shell words, so
+ * `format(x)` in a source file is not mistaken for a volume format.
+ */
+const CODE_KEYS = Object.freeze({
+  run_code: 'code',
+  'run-code': 'code',
+  runcode: 'code',
+  execute_code: 'code',
+  eval_code: 'code',
+  code_interpreter: 'code',
+  python_exec: 'code',
+  node_exec: 'code',
+  python: 'code',
+  python3: 'code',
+  node: 'code',
+})
+const CODE_TOOL_RE = /(?:^|[_\-.])(?:run[_\-]?code|execute[_\-]?code|code[_\-]?interp(?:reter)?|repl)(?:$|[_\-.]|code)/
+/** Where a code tool keeps its source, in the order they are tried. */
+const CODE_ARG_KEYS = ['code', 'source', 'script']
+
 /** Keys that make a third-party tool argument worth checking at deny tiers. */
 const GENERIC_PATH_KEY_RE = /(?:^|_)(?:file_?path|path|target|destination|dest|dir|directory|source|src|origin|out_?file|out_?path|output|filename|root)$/i
 const GENERIC_DIR_SKIP_RE = /(?:^|_)(?:cwd|workdir|working_directory|basedir|base_dir|root)$/i
@@ -109,6 +135,7 @@ export function actionForTier(tier, tierActions) {
  *   tierActions: Record<string, string>,
  *   protectWrites: boolean,
  *   scanShell: boolean,
+ *   scanScripts?: boolean,
  *   resolveSymlinksInsideWorkspace: boolean,
  *   genericPathSweep: boolean,
  * }} input
@@ -136,7 +163,8 @@ export function decideToolCall(input) {
     const absoluteRaw = expandVariables(stripQuotes(String(raw)), ctx)
     const absolute = normalizeAbsolute(absoluteRaw.text, ctx, base ?? input.sessionRoot ?? ctx.cwd)
     if (absolute === undefined) return
-    const verdict = classifyKey(absolute, ctx, { sessionRoot: input.sessionRoot })
+    const real = input.fs === undefined ? undefined : resolveExistingPath(absolute, ctx, input.fs)
+    const verdict = classifyKey(absolute, ctx, { sessionRoot: input.sessionRoot, fs: input.fs, real })
     if (verdict === undefined || verdict.tier === 'allow') return
     hits.push({ tier: verdict.tier, id: verdict.id, path: absolute, raw: String(raw), via: meta.via, op: meta.op, ...(meta.generic === true ? { generic: true } : {}) })
   }
@@ -189,10 +217,29 @@ export function decideToolCall(input) {
         fs: input.fs,
         resolveSymlinksInsideWorkspace: input.resolveSymlinksInsideWorkspace,
         protectWrites: input.protectWrites,
+        scanScripts: input.scanScripts,
         stop,
       })
       for (const finding of scanned.findings) hits.push(finding)
       notes.push(...scanned.notes)
+    }
+  }
+
+  // 3b. Code tools: the source itself is the dangerous argument.
+  const codeTool = CODE_KEYS[name] !== undefined || CODE_TOOL_RE.test(name)
+  if (codeTool) {
+    for (const key of CODE_ARG_KEYS) {
+      const source = parsed[key]
+      if (typeof source !== 'string' || source.trim() === '') continue
+      hits.push(...scanCodePayload({
+        code: source,
+        cwd: cwdOf(),
+        ctx,
+        sessionRoot: input.sessionRoot,
+        fs: input.fs,
+        resolveSymlinksInsideWorkspace: input.resolveSymlinksInsideWorkspace,
+        protectWrites: input.protectWrites,
+      }))
     }
   }
 
@@ -329,4 +376,54 @@ export function formatReason(decision, options = {}) {
 export function formatLogLine(decision, toolName) {
   const hits = decision.hits.slice(0, 3).map(hit => `${hit.tier}:${hit.path ?? hit.raw}`).join(' ')
   return `${decision.action.toUpperCase()} ${toolName} ${hits}`.trim()
+}
+
+/**
+ * Would this call disable, uninstall or replace *this* plugin?
+ *
+ * `plugin_manager` and `plugin_market` are exempt from path rules — they are how
+ * a person manages bundles. But a blanket exemption also lets a model switch the
+ * guard off from inside a session (`set_bundle` with `enabled: false` for this
+ * package), which is the one exemption that defeats the whole plugin. So an
+ * exempt tool is still judged for the one call that matters: it names this
+ * plugin *and* turns it off or removes it.
+ *
+ * @param {unknown} args the tool call arguments
+ * @param {string[]} selfNames spellings that identify this plugin
+ * @returns {{ target: string } | undefined}
+ */
+export function selfDisturbance(args, selfNames) {
+  if (args === null || typeof args !== 'object') return undefined
+  const names = (selfNames ?? []).map(name => String(name).toLowerCase()).filter(name => name !== '')
+  if (names.length === 0) return undefined
+
+  /** @type {string | undefined} */
+  let target
+  let disabling = false
+  const isSelf = text => names.some(name => text.toLowerCase().includes(name))
+  const isDisablingWord = text => /(?:^|[_\-.\s])(?:disable|disabled|remove|removed|uninstall|delete|deactivate|purge|drop|off)(?:$|[_\-.\s])/i.test(text)
+
+  const visit = (value, key, depth) => {
+    if (depth > 4 || value === null || value === undefined) return
+    if (typeof value === 'string') {
+      if (isSelf(value)) target = value
+      if (isDisablingWord(value)) disabling = true
+      return
+    }
+    if (typeof value === 'boolean') {
+      // `set_bundle` / `set_plugin` say "off" with a boolean, not a word.
+      if (value === false && /^(?:enabled|active|installed|keep)$/i.test(key ?? '')) disabling = true
+      return
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item, key, depth + 1)
+      return
+    }
+    if (typeof value === 'object') {
+      for (const [childKey, child] of Object.entries(value)) visit(child, childKey, depth + 1)
+    }
+  }
+  visit(args, undefined, 0)
+  if (target === undefined || !disabling) return undefined
+  return { target }
 }

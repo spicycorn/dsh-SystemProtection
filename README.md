@@ -37,6 +37,18 @@ Three independent layers enforce this:
 
 It reads *shell text*, not only file paths: `rm`, `del`, `rd`, `Remove-Item`, `mv`, `mvn`-style moves, `find -delete`, `find -exec rm`, `xargs`, redirections (`> file`, `dd of=/dev/sda`), truncation, `git` history operations, `powershell -EncodedCommand` (base64 → UTF-16LE → UTF-8), nested `bash -c` / `cmd /c` payloads, `python -c "shutil.rmtree(...)"`, `sudo`/`env`/`nice` wrappers, `cd X && rm y`, `--` separators, globs, `$env:VAR` / `${HOME}` / `%USERPROFILE%` expansion, `\\?\C:\` extended prefixes, and symlinks pointing outside the workspace. Unknown MCP tools are swept for path-shaped arguments (`path`, `file_path`, `target`, `source`, `output`, …) whenever their name says they write or delete.
 
+Version 1.1.0 answers the attacks in [`docs/system-protection-测评报告-2026-11-25.md`](docs/system-protection-测评报告-2026-11-25.md):
+
+- **The boot chain, by command rather than by path.** `bcdedit` (any mutating form), `bootrec /fixmbr` / `/fixboot` / `/rebuildbcd`, `bcdboot`, `bootsect`, `mbr2gpt`, `reagentc /disable`, `mountvol /S` and `fsutil file setzerodata` are denied by their own name and form. Read-only forms (`bcdedit /enum`, `reagentc /info`, `mountvol`) still pass.
+- **The EFI system partition is protected without a drive letter.** Slices of a volume — `\\?\Volume{…}\EFI\…`, `\EFI`, `\boot`, `\Recovery`, `\$WinREAgent`, `\System Volume Information`, an offline `\Windows\System32` — are judged on *every* volume, so `mountvol S: /S` and then `del S:\EFI\…` is still a denial.
+- **One file, several spellings.** This machine's administrative shares (`\\localhost\C$\Windows` and `\\<computer-name>\ADMIN$\System32`), 8.3 short names (`C:\PROGRA~1`), `subst` drive letters and junctions are resolved and judged as the path they really are. A share on another machine stays a network path.
+- **A script is a shell in disguise.** When a command would *run* a local script (`pwsh -File x.ps1`, `bash ./build.sh`, `. .\profile.ps1`, `python tools/x.py`, `cmd /c x.bat`), the file is read — bounded to 256 KiB, at most 8 files, never a directory listing — and scanned before it runs. `scanScripts: false` turns this off.
+- **`cmd /c "cd /d … && del relative"` resolves against the new directory**, and `robocopy /MIR`, `forfiles /c "del @path"` and copy destinations are recognised as destructive.
+- **Code tools are read as code.** `run_code` / `execute_code` / REPL-style tools are scanned for file-API calls (`shutil.rmtree("C:\\Windows")`, `fs.rmSync(…)`) and literal `exec("…")` commands.
+- **The guard cannot be switched off from inside the session.** `plugin_manager` and `plugin_market` stay exempt except for a call that names this plugin and disables or removes it.
+- **The plugin fails closed.** `onInternalError` now defaults to `closed`, on the tool guard and on the file-system seam.
+
+
 ## Install
 
 The plugin is **not** installed by this repository; you install it. Verified against the current desktop build's plugin page.
@@ -61,7 +73,7 @@ The plugin is **not** installed by this repository; you install it. Verified aga
 
    The call comes back failed with the `system-protection` / `PROTECTED_PATH` reason and the `system` tier named, and `/system-protection status` shows `denied 1`. Worst case, if the plugin were somehow not enforcing, DSH's own OS sandbox refuses the write as well, and the only artefact would be one stray file you can delete.
 
-To turn it off or take it out: the bundle switch on its page (a `config: { enabled: false }` edit does the same thing), or **Uninstall** (卸载) with its confirmation. This plugin never blocks `plugin_manager` or `plugin_market`, so you can always remove it.
+To turn it off or take it out: the bundle switch on its page (a `config: { enabled: false }` edit does the same thing), or **Uninstall** (卸载) with its confirmation. `plugin_manager` and `plugin_market` stay exempt so you can always manage bundles — the one exception is a call that names *this* plugin and disables or uninstalls it while it is running, which the model must not be able to do from inside a session (`selfProtect: false` removes even that check).
 
 If you already maintain a profile patch, copy the row from [`cordis.patch.yml`](cordis.patch.yml) into it once the package is resolvable; the row id is `system-protection`.
 
@@ -86,15 +98,18 @@ Everything lives in the row's `config` (see the commented block in [`cordis.patc
 | `tiers` | table above | Per-tier action: `deny`, `ask`, or `off`. |
 | `protectWrites` | `true` | Overwriting a protected file is treated like deleting it. |
 | `scanShell` | `true` | Read the text of `bash` / `pwsh` / `terminal_send` commands. |
+| `scanScripts` | `true` | Read (≤ 256 KiB, ≤ 8 files) a local script a command would run, and scan it first. |
+| `selfProtect` | `true` | Even an exempt tool cannot disable or uninstall this plugin. |
 | `genericPathSweep` | `true` | Sweep path arguments of unknown write/delete tools. |
 | `sweepTools` / `sweepSkipTools` | `[]` | Force the sweep on, or exempt a tool name from it. |
-| `exemptTools` | `plugin_manager`, `plugin_market` | Tools that must be able to manage this very plugin. |
+| `exemptTools` | `plugin_manager`, `plugin_market` | Tools that must be able to manage this very plugin (still subject to `selfProtect`). |
 | `protectExtra` | `[]` | Your own prefixes to protect, `~`/`%ENV%` allowed. |
 | `allowExtra` | `[]` | Your own escape hatch; beats every tier, including `system`. |
+| `allowCommands` | `[]` | Commands you permit by name (`mountvol`, `bcdboot`, …). A form-only denial names no path, so `allowExtra` cannot open it. |
 | `resolveSymlinksInsideWorkspace` | `false` | Also `realpath` links that live inside the workspace (slower, stricter). |
 | `auditLog` | `""` | Absolute path; append one JSON line per non-allow decision. |
 | `denyNote` | `""` | Extra sentence added to every message, e.g. where backups live. |
-| `onInternalError` | `open` | `closed` denies calls when the plugin itself throws. |
+| `onInternalError` | `closed` | `closed` denies calls when the plugin itself throws; `open` lets them through. |
 | `messageLocale` | `auto` | `auto` \| `en` \| `zh`. |
 | `modelGuidance` | `true` | Contribute one short system-prompt section telling the model these limits exist and to state its reason before touching those paths. |
 
@@ -121,7 +136,8 @@ The same rule is given to the model in advance (`modelGuidance`), so the reason 
 
 ## Limits, honestly
 
-- Shell inspection is text analysis. What the command assigns to its own variables **is** resolved — `$p = 'C:\…\.git\config'; Remove-Item $p` is denied, and the verdict says so in its notes — because the plugin reads the literals the command itself puts on the table. What it cannot resolve stays honestly open: a value from `Read-Host` or a prompt, a string built at runtime (`"$env:SystemRoot\x"`, `-f` formatting), `Invoke-Expression` / `& $p`, a payload downloaded and run, or a variable set by an *earlier* call. A compiled helper taking an index into a table, or a script written to disk and then executed, can hide a target too. Underneath all of it, the file-system layer (3) and the OS sandbox still apply.
+- Shell inspection is text analysis. What the command assigns to its own variables **is** resolved — `$p = 'C:\…\.git\config'; Remove-Item $p` is denied, and the verdict says so in its notes — because the plugin reads the literals the command itself puts on the table. What it cannot resolve stays honestly open: a value from `Read-Host` or a prompt, a string built at runtime (`"$env:SystemRoot\x"`, `-f` formatting), `Invoke-Expression` / `& $p`, a payload downloaded and run, or a variable set by an *earlier* call. A compiled helper taking an index into a table can hide a target too.
+- A script the command *runs* is scanned (1.1.0), but only when the command names it in a form the scanner recognises: `pwsh -File x.ps1`, `bash ./x.sh`, `. .\x.ps1`, `python x.py`, `cmd /c x.bat`, or the script itself as the command. A script reached through `& $path`, `Invoke-Expression (Get-Content x)`, a downloaded payload, or a program that decides internally what to run is still outside text analysis. The file-system layer (3) and the OS sandbox stay underneath all of it.
 - The scanner follows the shell rather than guessing intent. `Remove-Item D:\My App\file.txt`, unquoted, is two arguments to PowerShell and it deletes neither, so the plugin sees two arguments as well. Quote paths that contain spaces.
 - Wiping a filesystem root is denied in every spelling the tests can think of: `rm -rf /`, `rm -rf /*`, `rm -rf ~/*`, `Remove-Item C:\ -Recurse`, and the same hidden behind a variable. A glob inside your workspace (`rm -rf ./out/*`) is still just cleanup.
 - The application directory is protected as `harness`. It comes from `DSH_INSTALL_DIR` / `DSH_NODE_EXECUTABLE` when the launcher exports them, and otherwise from the running process itself (a packaged desktop app knows its own executable and `resources` directory). Two edges are left open on purpose: a plain `node` process never makes its own tree the install — that would deny every `npm install` under it — and an app installed *directly on a drive root* is not inferred, because protecting a whole volume by accident is worse than the miss it trades. Both cases are one `protectExtra` line.
@@ -140,15 +156,15 @@ No, and this is measured rather than promised. The plugin's entire interaction w
 | Surface | Reality |
 | --- | --- |
 | File writes | One: `fs.appendFileSync` to the `auditLog` path you set. Off by default → zero writes. |
-| File reads | None. It never opens a file, never reads contents, never lists a directory. |
-| Metadata lookups | `existsSync` / `lstatSync` / `realpathSync` on exactly the paths a call named (to resolve symlinks). Metadata only, no content. |
+| File reads | Exactly one kind, added in 1.1.0: the text of a *script the call itself names to run* (`pwsh -File x.ps1`, `bash ./build.sh`, `python tools/x.py`), bounded to 256 KiB and eight files, never a directory listing, and switched off with `scanScripts: false`. Nothing else is ever read. |
+| Metadata lookups | `existsSync` / `lstatSync` / `realpathSync` on exactly the paths a call named (to resolve symlinks, drives and 8.3 names). Metadata only, no content. |
 | Processes | None. `node:child_process` is not imported. |
 | Network | None. No `http` / `net` / `dns` / `tls` / `fetch`. |
 | Global state | No signal handlers, no timers, no `process.env` writes, no `chdir`, no prototype patching. Disposing the plugin removes its guard and listeners. |
 | Reach | In-process only. It hooks DSH's tool pipeline and DSH's file-system seam, so it cannot affect any program other than DSH, and cannot see anything outside the calls DSH routes to it. |
-| Self-defense | It never blocks `plugin_manager` / `plugin_market`, so uninstalling it always works. |
+| Self-defense | It answers `plugin_manager` / `plugin_market` normally, except a call that names this plugin and disables or uninstalls it — the one action that would leave the machine unprotected mid-session. That check has its own switch (`selfProtect: false`). |
 
-`npm test` includes `test/no-touch.mjs`, which replaces every function on `node:fs`, `node:fs/promises`, `node:child_process`, `node:net`, and `node:http` with a recording proxy, throws on any write-shaped call, then runs the plugin through 24 hostile calls across all three layers and the three commands. It asserts: zero mutating calls, zero content reads, zero directory listings, zero spawns, zero sockets, unchanged `process.env` / `cwd` / signal listeners / active handles — and in the opt-in phase, that the single write lands exactly on the configured audit path via an append flag.
+`npm test` includes `test/no-touch.mjs`, which replaces every function on `node:fs`, `node:fs/promises`, `node:child_process`, `node:net`, and `node:http` with a recording proxy, throws on any write-shaped call, then runs the plugin through 25 hostile calls across all three layers and the three commands. It asserts: zero mutating calls, no directory listing, the only content read is the script the call named, zero spawns, zero sockets, unchanged `process.env` / `cwd` / signal listeners / active handles — and in the opt-in phase, that the single write lands exactly on the configured audit path via an append flag.
 
 ### What it costs a session
 
@@ -156,18 +172,18 @@ The guard is synchronous and cheap, and `test/perf.mjs` keeps it that way (measu
 
 | Input | Cost | Verdict |
 | --- | --- | --- |
-| `rm -rf ./build && echo done` | 0.18 ms | allow |
-| 20 000 chained segments, all safe | 172 ms | allow |
-| 1 MB of benign command text | 251 ms | allow |
-| 20 000 chained segments, one of them hostile | 42 ms | deny |
-| 60 nested `bash -c`, hostile target inside | 0.26 ms | deny |
+| `rm -rf ./build && echo done` | 0.6 ms | allow |
+| 20 000 chained segments, all safe | 462 ms | allow |
+| 1 MB of benign command text | 530 ms | allow |
+| 20 000 chained segments, one of them hostile | 92 ms | deny |
+| 60 nested `bash -c`, hostile target inside | 0.7 ms | deny |
 
-Cost is linear in the size of the argument, and scanning stops at the first operand that reaches a `deny` tier — the verdict cannot get stricter after that. A megabyte-long single command is a quarter of a second, which a shell launch swallows anyway.
+Cost is linear in the size of the argument, and scanning stops at the first operand that reaches a `deny` tier — the verdict cannot get stricter after that. A megabyte-long single command is half a second, which a shell launch swallows anyway.
 
 ## Development
 
 ```bash
-npm test          # 77 decision checks + 22 wiring + 17 no-touch + 10 performance checks
+npm test          # 175 decision checks + 44 wiring + 18 no-touch + 10 performance + 13 packaging checks
 ```
 
 - `test/selftest.mjs` — simulated Windows and Linux machines, no install, no network.

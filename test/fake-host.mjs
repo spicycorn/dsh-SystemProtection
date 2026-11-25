@@ -15,7 +15,7 @@ import path from 'node:path'
 import process from 'node:process'
 import { fileURLToPath } from 'node:url'
 
-import { apply, inject } from '../index.js'
+import { apply, inject, normalizeConfig } from '../index.js'
 import { createHost, SYSTEM_TARGET, WORKSPACE } from './host.mjs'
 
 let passed = 0
@@ -79,6 +79,48 @@ check('ordinary workspace work passes the guard', () => {
 
 check('plugin_manager stays exempt', () => {
   assert.equal(host.runGuards('plugin_manager', { action: 'remove_bundle', target: 'x@1.0.0' }), undefined)
+})
+
+// The exemption is how a person manages bundles; it must not also let a model
+// disarm the guard. This is report finding P11.
+check('plugin_manager cannot switch this plugin off', () => {
+  const verdict = host.runGuards('plugin_manager', { action: 'set_bundle', target: '@local/system-protection', enabled: false })
+  assert.ok(verdict !== undefined, 'expected a denial')
+  assert.equal(verdict.info.code, 'PROTECTED_SELF')
+  assert.match(verdict.reason, /system-protection|protected/i)
+})
+check('a model cannot uninstall the protection plugin either', () => {
+  const verdict = host.runGuards('plugin_manager', { action: 'remove_bundle', target: '@local/system-protection' })
+  assert.ok(verdict !== undefined, 'expected a denial')
+  assert.equal(verdict.info.code, 'PROTECTED_SELF')
+})
+check('a plugin_market removal of the plugin is denied too', () => {
+  const verdict = host.runGuards('plugin_market', { action: 'uninstall', package: 'system-protection' })
+  assert.ok(verdict !== undefined, 'expected a denial')
+  assert.equal(verdict.info.code, 'PROTECTED_SELF')
+})
+check('self-protection is the owner\'s switch, not the model\'s', () => {
+  const open = createHost()
+  apply(open.ctx, { selfProtect: false })
+  assert.equal(open.runGuards('plugin_manager', { action: 'set_bundle', target: '@local/system-protection', enabled: false }), undefined)
+  open.disposeAll()
+})
+check('the default configuration fails closed (report finding P12)', () => {
+  const settings = normalizeConfig({}, { warn: () => {}, info: () => {} })
+  assert.equal(settings.onInternalError, 'closed')
+})
+check('an internal error denies the call when the plugin fails closed', () => {
+  const broken = { name: 'write', get arguments() { throw new Error('boom') }, agent: host.agent }
+  const verdict = host.guards[0](broken)
+  assert.ok(verdict !== undefined, 'expected a denial')
+  assert.equal(verdict.info.code, 'PROTECTION_UNAVAILABLE')
+})
+check('...and lets it through only when the owner chose onInternalError: open', () => {
+  const open = createHost()
+  apply(open.ctx, { onInternalError: 'open' })
+  const broken = { name: 'write', get arguments() { throw new Error('boom') }, agent: open.agent }
+  assert.equal(open.guards[0](broken), undefined)
+  open.disposeAll()
 })
 
 const askVerdict = await host.runPreExecute('bash', { command: 'rm -f ~/.npmrc' })
@@ -153,6 +195,8 @@ const status = host.runCommand('system-protection', 'status')
 check('/system-protection status reports the tier table', () => {
   assert.equal(status.kind, 'success')
   assert.match(status.text, /system-protection: enabled, enforce/)
+  assert.match(status.text, /on internal error: closed/)
+  assert.match(status.text, /self-protection: on/)
   assert.match(status.text, /system\s+deny/)
   assert.match(status.text, /denied/)
 })

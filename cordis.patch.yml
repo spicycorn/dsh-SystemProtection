@@ -19,14 +19,16 @@
 #         enforcement: enforce          # enforce | audit (audit only logs)
 #         protectWrites: true           # also guard overwriting a protected file
 #         scanShell: true               # read bash / pwsh command text
+#         scanScripts: true             # read (bounded) a script the command names, then scan it
 #         genericPathSweep: true        # unknown (MCP) tools whose name writes: check their path args
 #         resolveSymlinksInsideWorkspace: false
 #         exemptTools: ['plugin_manager', 'plugin_market']
+#         selfProtect: true            # an exempt tool still cannot switch THIS plugin off
 #         sweepTools: []                # force the generic sweep for these tool names
 #         sweepSkipTools: ['myfs_view'] # never sweep these
 #         auditLog: ''                  # absolute path: append one JSON line per decision
 #         denyNote: ''                  # extra sentence added to every denial message
-#         onInternalError: open         # open | closed
+#         onInternalError: closed       # open | closed (closed denies when the plugin itself throws)
 #         messageLocale: auto           # auto | en | zh
 #         modelGuidance: true           # false = never touch the system prompt
 #         tiers:

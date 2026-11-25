@@ -17,7 +17,7 @@
  * @module system-protection/shell-scan
  */
 
-import { escapesNext, expandVariables, isWildcardOperand, isWithin, normalizeAbsolute, pathKey, stripQuotes } from './paths.js'
+import { escapesNext, expandVariables, isWildcardOperand, isWithin, normalizeAbsolute, pathKey, resolveExistingPath, stripQuotes } from './paths.js'
 import { classifyKey, TIER_RANK } from './rules.js'
 
 /** Prefix commands that only change how the real command runs. */
@@ -64,8 +64,98 @@ const BLANKET = [
 /** `dd of=/dev/sda`, `> /dev/sda`, `cat x > /dev/nvme0n1`: a device write is a wipe. */
 const DEVICE_WRITE_RE = /^\/dev\/(?:sd[a-z]|nvme\d+n\d+|mmcblk\d+|disk\d+|hd[a-z])$/
 
+/**
+ * Windows commands that damage the boot chain or a volume without naming a file
+ * to delete. They are judged by *form*: `bcdedit /enum` only prints and stays
+ * allowed, `bcdedit /delete {current} /f` is a machine that will not boot.
+ *
+ * Every entry answers one question — is this invocation destructive? — from the
+ * lower-cased argument text. The switches are matched as words in the joined
+ * line rather than as exact tokens, so a launcher that packs them into one
+ * quoted argument (`Start-Process bcdedit -ArgumentList "/delete {current} /f"`)
+ * is read the same way. A shell this scanner cannot be sure about is treated as
+ * destructive: being told to use a different command is recoverable, a rewritten
+ * boot sector is not.
+ */
+function commandLine(args) {
+  return args.join(' ')
+}
+
+const SYSTEM_COMMANDS = [
+  {
+    verb: 'bcdedit',
+    id: 'shell:bcdedit',
+    note: 'bcdedit rewrites the boot configuration; a wrong value means the machine will not start',
+    danger: args => /(?:^|\s)[/-](?:set|delete|deletevalue|create|copy|import|cleanup|setidentifier|bootsequence|displayorder|toolsdisplayorder|timeout|default|dbgsettings|hypervisorsettings|setbootmgr|bootems)(?:\s|$)/.test(commandLine(args)),
+  },
+  {
+    verb: 'bootrec',
+    id: 'shell:bootrec',
+    note: 'bootrec rewrites the boot sector or the boot configuration',
+    danger: args => /(?:^|\s)\/?(?:fixmbr|fixboot|rebuildbcd)(?:\s|$)/.test(commandLine(args)),
+  },
+  { verb: 'bcdboot', id: 'shell:bcdboot', note: 'bcdboot rewrites the boot files of a volume', danger: () => true },
+  { verb: 'bootsect', id: 'shell:bootsect', note: 'bootsect rewrites the boot sector', danger: () => true },
+  { verb: 'mbr2gpt', id: 'shell:mbr2gpt', note: 'mbr2gpt converts the partition table; a failure leaves the machine unbootable', danger: () => true },
+  {
+    verb: 'reagentc',
+    id: 'shell:reagentc',
+    note: 'reagentc changes or removes the Windows Recovery Environment',
+    danger: args => /(?:^|\s)[/-](?:disable|enable|setreimage|setosimage|boottore|setreimageinfo)(?:\s|$)/.test(commandLine(args)),
+  },
+  {
+    verb: 'mountvol',
+    id: 'shell:mountvol',
+    note: 'mountvol mounts an EFI system partition (or removes a volume mount) so its boot files become ordinary files',
+    danger: args => /(?:^|\s)[/-](?:s|d|p|r|n)(?:\s|$)|\\\\[?.]\\volume\{/i.test(commandLine(args)),
+  },
+  {
+    verb: 'fsutil',
+    id: 'shell:fsutil',
+    note: 'fsutil can overwrite the contents of a file or damage a volume\'s metadata',
+    danger: args => /(?:^|\s)(?:setzerodata|setvaliddata|deletejournal|dismount)(?:\s|$)/.test(commandLine(args))
+      || /(?:^|\s)dirty\s+set(?:\s|$)/.test(commandLine(args)),
+    classifyPaths: true,
+  },
+]
+
+/** Commands whose destination operand is overwritten or mirrored over. */
+const COPY_VERBS = new Set(['cp', 'copy', 'copy-item', 'cpi', 'xcopy', 'robocopy', 'install'])
+
+/** Script files this scanner is willing to read, and the dialect to read them in. */
+const SCRIPT_EXTS = new Map([
+  ['.ps1', 'ps'], ['.psm1', 'ps'], ['.psd1', 'ps'],
+  ['.bat', 'cmd'], ['.cmd', 'cmd'],
+  ['.sh', 'sh'], ['.bash', 'sh'], ['.zsh', 'sh'], ['.ksh', 'sh'], ['.dash', 'sh'],
+  ['.py', 'code'], ['.pyw', 'code'], ['.js', 'code'], ['.mjs', 'code'], ['.cjs', 'code'],
+  ['.rb', 'code'], ['.pl', 'code'], ['.vbs', 'code'], ['.wsf', 'code'],
+])
+
+/** Interpreters that run the script named after them. */
+const SCRIPT_HOSTS = new Set([
+  ...POSIX_SHELLS, ...CMD_WRAPPERS,
+  'pwsh', 'powershell', 'powershell_ise', 'pwsh.exe', 'powershell.exe',
+  'python', 'python2', 'python3', 'py', 'node', 'nodejs', 'deno', 'bun', 'perl', 'ruby', 'php', 'wscript', 'cscript',
+])
+
+/** A switch whose *next* token is the script to run. */
+const SCRIPT_RUNNER_FLAGS = new Set(['-file', '-f', '/c', '/k', '-command', '-c', '-e', 'source', 'call', '.'])
+
+/** Bounds: reading a script must never become a way to read a whole disk. */
+const MAX_SCRIPT_BYTES = 256 * 1024
+const MAX_SCRIPT_FILES = 8
+const MAX_SCAN_TEXTS = 40
+/** Depth of nested shell commands extracted from code payloads. */
+const MAX_CODE_DEPTH = 2
+/** A cheap pre-test before tokenizing a segment for script references. */
+const SCRIPT_EXT_HINT = /\.(?:ps1|psm1|psd1|bat|cmd|sh|bash|zsh|ksh|dash|py|pyw|js|mjs|cjs|rb|pl|vbs|wsf)\b/i
+
 /** Direct file-API calls inside embedded code payloads. */
-const CODE_DELETE_RE = /(?:fs\.(?:rm|rmSync|unlink|unlinkSync|remove|rmdir|rimraf)(?:Sync)?|os\.(?:remove|unlink)|shutil\.rmtree|pathlib\.rmtree|Path\([^)]*\)\.unlink)\s*\(\s*(['"`])([^'"`]+)\1/g
+const CODE_DELETE_RE = /(?:fs\.(?:rm|rmSync|unlink|unlinkSync|remove|rmdir|rmdirSync|rimraf)(?:Sync)?|fs\.promises\.(?:rm|unlink|rmdir)|os\.(?:remove|unlink|rmdir)|shutil\.rmtree|send2trash\.send2trash|pathlib\.rmtree|Path\([^)]*\)\.unlink)\s*\(\s*(['"`])([^'"`]+)\1/g
+
+/** A literal command handed to a process API inside a code payload. */
+const CODE_EXEC_RE = /(?:execSync|exec|spawnSync|spawn|execFileSync|execFile|system|popen|check_output|run)\s*\(\s*(['"`])([^'"`\n]{2,400})\1/g
+
 
 /**
  * Flags whose value is a separate token that must not be read as a path.
@@ -118,7 +208,10 @@ export function splitSegments(text, dialect) {
     const next = chars[index + 1]
     if (quote !== '') {
       current += char
-      if (char === '\\' && quote === '"' && next !== undefined) {
+      // Only POSIX treats a backslash inside quotes as an escape: in cmd and
+      // PowerShell it is an ordinary path character, and consuming the next
+      // character turned `"\\?\Volume{…}\EFI"` into a path with one backslash.
+      if (char === '\\' && quote === '"' && dialect === 'sh' && next !== undefined) {
         current += next
         index++
         continue
@@ -198,13 +291,13 @@ export function tokenize(segment, dialect) {
     }
     if (quote !== '') {
       raw += char
-      if (char === '\\' && quote === '"' && escapesNext(next)) {
+      if (char === '\\' && quote === '"' && dialect === 'sh' && escapesNext(next)) {
         buffer += next
         raw += next
         index++
         continue
       }
-      if (char === '\\' && quote === '"') {
+      if (char === '\\' && quote === '"' && dialect === 'sh') {
         // `C:\Windows` inside quotes: a backslash before an ordinary character
         // is part of the path, not an escape of it.
         buffer += char
@@ -412,11 +505,15 @@ export function scanCommand(options) {
   const { command, cwd, ctx, sessionRoot } = options
   const dialect = options.dialect ?? 'sh'
   const protectWrites = options.protectWrites !== false
+  const scanScripts = options.scanScripts !== false
+  const depth = Number.isFinite(options.depth) ? options.depth : 0
   const findings = []
   const notes = []
   if (typeof command !== 'string' || command.trim() === '') return { findings, notes }
 
   const texts = gatherTexts(command, dialect)
+  const seenScripts = new Set()
+  let scriptFiles = 0
   // `stop` lets the caller bail out as soon as the verdict cannot get any
   // stricter. A guard that denies is already at maximum severity, so a huge
   // command that hits a protected path early costs microseconds, not
@@ -427,8 +524,72 @@ export function scanCommand(options) {
     notes.push('stopped early: the verdict could not get stricter')
     return true
   }
-  for (const entry of texts) {
-    if (texts.length > 1) notes.push(`decoded ${entry.via}`)
+
+  /**
+   * Read one local script the command itself would run, and scan its text.
+   *
+   * This is the one place the plugin reads a file, and it stays narrow: a file
+   * the call named, a regular file, at most 256 KiB, at most eight per command.
+   * A shell script is scanned as a command line; a program file is scanned for
+   * direct file-API calls and literal `exec("…")` strings. A script that cannot
+   * be read is reported in the notes and is not guessed at.
+   */
+  const loadScript = (reference, baseCwd) => {
+    if (!scanScripts || options.fs === undefined) return
+    if (scriptFiles >= MAX_SCRIPT_FILES || texts.length >= MAX_SCAN_TEXTS) return
+    if (typeof options.fs.readFileSync !== 'function' || typeof options.fs.statSync !== 'function') return
+    const expanded = expandVariables(stripQuotes(reference), ctx)
+    if (expanded.unresolved.length > 0) return
+    const absolute = normalizeAbsolute(expanded.text, ctx, baseCwd)
+    if (absolute === undefined || isWildcardOperand(absolute)) return
+    const key = pathKey(absolute, ctx)
+    if (seenScripts.has(key)) return
+    const scriptDialect = SCRIPT_EXTS.get(extensionOf(key))
+    if (scriptDialect === undefined) return
+    let size
+    try {
+      const stat = options.fs.statSync(absolute)
+      if (stat.isFile?.() === false) return
+      size = Number(stat.size)
+    }
+    catch {
+      return
+    }
+    if (!Number.isFinite(size) || size <= 0) return
+    if (size > MAX_SCRIPT_BYTES) {
+      seenScripts.add(key)
+      notes.push(`script not read: ${absolute} is ${size} bytes (limit ${MAX_SCRIPT_BYTES})`)
+      return
+    }
+    let text
+    try {
+      text = String(options.fs.readFileSync(absolute, 'utf8'))
+    }
+    catch {
+      return
+    }
+    seenScripts.add(key)
+    scriptFiles += 1
+    notes.push(`scanned script ${absolute}`)
+    if (scriptDialect === 'code') {
+      findings.push(...scanCodePayload({
+        code: text,
+        cwd: baseCwd,
+        ctx,
+        sessionRoot,
+        fs: options.fs,
+        resolveSymlinksInsideWorkspace: options.resolveSymlinksInsideWorkspace,
+        protectWrites,
+        depth: depth + 1,
+      }))
+      return
+    }
+    if (texts.length < MAX_SCAN_TEXTS) texts.push({ text, dialect: scriptDialect, via: `script:${absolute}` })
+  }
+
+  for (let entryIndex = 0; entryIndex < texts.length; entryIndex++) {
+    const entry = texts[entryIndex]
+    if (!entry.via.startsWith('script:') && texts.length > 1) notes.push(`decoded ${entry.via}`)
     let runningCwd = cwd
     /** Literals this command assigned to its own variables, in source order. */
     const vars = new Map()
@@ -436,24 +597,175 @@ export function scanCommand(options) {
       const segment = expandAssigned(source, vars, entry.dialect, notes)
       recordAssignment(segment, vars, entry.dialect)
       scanSegment({ segment, dialect: entry.dialect, cwd: runningCwd, ctx, sessionRoot, findings, notes, fs: options.fs, resolveSymlinksInsideWorkspace: options.resolveSymlinksInsideWorkspace, protectWrites })
+      for (const reference of scriptReferences(segment, entry.dialect)) loadScript(reference, runningCwd)
       // `cd /etc && rm passwd` — relative operands after a cd are resolved there.
       const moved = cdTarget(segment, entry.dialect, runningCwd, ctx)
       if (moved !== undefined) runningCwd = moved
       if (stopped()) return { findings: dedupe(findings), notes }
     }
-    // Direct file APIs inside a code payload (`shutil.rmtree("/etc")`).
-    for (const match of entry.text.matchAll(CODE_DELETE_RE)) {
-      const value = match[2]
-      const via = 'code-api'
-      findings.push(...classifyOperand({ raw: value, cwd: runningCwd, ctx, sessionRoot, verb: match[1], via, fs: options.fs, resolveSymlinksInsideWorkspace: options.resolveSymlinksInsideWorkspace }))
-      if (stopped()) return { findings: dedupe(findings), notes }
-    }
+    // Direct file APIs and literal process-exec strings inside a code payload.
+    findings.push(...scanCodePayload({
+      code: entry.text,
+      cwd: runningCwd,
+      ctx,
+      sessionRoot,
+      fs: options.fs,
+      resolveSymlinksInsideWorkspace: options.resolveSymlinksInsideWorkspace,
+      protectWrites,
+      depth,
+    }))
+    if (stopped()) return { findings: dedupe(findings), notes }
   }
   return { findings: dedupe(findings), notes }
 }
 
+/** The lower-cased extension of a path or command word. */
+function extensionOf(value) {
+  const text = String(value ?? '').replace(/["']/g, '')
+  const dot = text.lastIndexOf('.')
+  if (dot < 0 || dot < Math.max(text.lastIndexOf('/'), text.lastIndexOf('\\'))) return ''
+  return text.slice(dot).toLowerCase()
+}
+
 /**
- * Where a `cd …` segment lands, so the rest of the line resolves against it.
+ * The script files one segment would *run* (not merely name).
+ *
+ * `pwsh -File .\cleanup.ps1`, `bash ./build.sh`, `python tools/release.py`,
+ * `cmd /c x.bat`, `. .\profile.ps1` and `.\cleanup.ps1` all execute the file,
+ * and a script written moments earlier is the cheapest way around a command-line
+ * scanner. A delete, a move or a read-only command that happens to name a
+ * script does not execute it, so those are left alone.
+ *
+ * @param {string} segment
+ * @param {string} dialect
+ * @returns {string[]} script references, unresolved
+ */
+function scriptReferences(segment, dialect) {
+  // Tokenizing a megabyte-long segment only to discover it names no script at
+  // all is the slowest thing this scanner could do, so look for the extension
+  // first with a plain substring test.
+  if (!SCRIPT_EXT_HINT.test(segment)) return []
+  const tokens = tokenize(segment, dialect)
+  if (tokens.length === 0) return []
+  let index = 0
+  while (index < tokens.length && isWrapper(tokens[index].text, dialect)) index++
+  const leadToken = tokens[index]
+  if (leadToken === undefined) return []
+  const lead = normalizeVerb(leadToken.text, dialect)
+  if (READ_ONLY_VERBS.has(lead) || isMutationVerb(lead)) return []
+
+  const references = []
+  const add = token => {
+    if (token === undefined || token.redirection === true || token.text.startsWith('-')) return
+    if (!SCRIPT_EXTS.has(extensionOf(token.text))) return
+    if (!references.includes(token.text)) references.push(token.text)
+  }
+  // The command itself is a script: `.\cleanup.ps1`, `.\build.sh`.
+  add(leadToken)
+
+  if (SCRIPT_HOSTS.has(lead) || lead === '&' || lead === 'source' || lead === '.') {
+    for (let i = index + 1; i < tokens.length; i++) {
+      const token = tokens[i]
+      const flag = token.text.toLowerCase()
+      if (SCRIPT_RUNNER_FLAGS.has(flag)) {
+        add(tokens[i + 1])
+        i += 1
+        continue
+      }
+      if (isSwitchToken(token.text, dialect)) continue
+      // The interpreter runs the first operand that *is* a script file; the rest
+      // are that script's arguments, not scripts of their own.
+      if (SCRIPT_EXTS.has(extensionOf(token.text))) {
+        add(token)
+        break
+      }
+    }
+  }
+  return references
+}
+
+/**
+ * Scan the source of a `run_code`-style call (or a program file a shell ran)
+ * for file APIs and literal commands.
+ *
+ * A code tool is a shell in disguise: `shutil.rmtree("C:\\Windows")` never
+ * reaches the shell scanner, and the generic path sweep only reads arguments
+ * that look like paths. This reads the code as code — the API call pattern and a
+ * literal `exec("…")` string — never as a shell word list, because `format(x)`
+ * in a source file is a function call, not a volume format.
+ *
+ * @param {{
+ *   code: string, cwd: string, ctx: object, sessionRoot?: string,
+ *   fs?: Partial<typeof import('node:fs')>, resolveSymlinksInsideWorkspace?: boolean,
+ *   protectWrites?: boolean, depth?: number,
+ * }} options
+ * @returns {object[]} findings, one per protected target
+ */
+export function scanCodePayload(options) {
+  const { code, cwd, ctx, sessionRoot } = options
+  const findings = []
+  if (typeof code !== 'string' || code === '') return findings
+  const depth = Number.isFinite(options.depth) ? options.depth : 0
+  const shared = {
+    cwd,
+    ctx,
+    sessionRoot,
+    fs: options.fs,
+    resolveSymlinksInsideWorkspace: options.resolveSymlinksInsideWorkspace,
+    op: 'delete',
+  }
+  for (const match of code.matchAll(CODE_DELETE_RE)) {
+    findings.push(...classifyOperand({ ...shared, raw: match[2], verb: match[1], via: 'code-api' }))
+  }
+  if (depth < MAX_CODE_DEPTH) {
+    // A cheap linear pre-test: a megabyte of ordinary command text must not pay
+    // for a second full regex pass that cannot match.
+    if (/\b(?:exec|spawn|system|popen|check_output|run)\s*\(/.test(code)) {
+      for (const match of code.matchAll(CODE_EXEC_RE)) {
+        const command = match[2]
+        if (command === undefined || command.trim() === '') continue
+        const scanned = scanCommand({
+          command,
+          cwd,
+          ctx,
+          sessionRoot,
+          dialect: 'sh',
+          fs: options.fs,
+          resolveSymlinksInsideWorkspace: options.resolveSymlinksInsideWorkspace,
+          protectWrites: options.protectWrites !== false,
+          scanScripts: false,
+          depth: depth + 1,
+        })
+        findings.push(...scanned.findings)
+      }
+    }
+  }
+  return findings
+}
+
+/**
+ * A switch token, spelled the way this dialect spells switches.
+ *
+ * `cd /d C:\Windows\System32` is the cmd form the field test used: the old
+ * reader took `/d` for the target, moved the running directory to `C:\d`, and
+ * then resolved the relative `del` against it — so a delete of a system file
+ * became a delete inside a harmless directory.
+ *
+ * @param {string} text
+ * @param {string} dialect
+ */
+function isSwitchToken(text, dialect) {
+  if (text === '') return false
+  if (text.startsWith('-')) return true
+  if (dialect === 'sh') return false
+  // `cmd` and PowerShell accept `/s`, `/MIR`, `/c:`; a path has another
+  // separator in it, so it is never mistaken for a switch.
+  return /^\/[A-Za-z][\w:.,+\-]*$/.test(text) && !text.includes('\\')
+}
+
+/**
+ * Where a `cd …` / `chdir` / `pushd` segment lands, so the rest of the line
+ * resolves against it.
  * @returns {string | undefined}
  */
 function cdTarget(segment, dialect, cwd, ctx) {
@@ -461,8 +773,9 @@ function cdTarget(segment, dialect, cwd, ctx) {
   if (tokens.length === 0) return undefined
   let index = 0
   while (index < tokens.length && isWrapper(tokens[index].text, dialect)) index++
-  if (normalizeVerb(tokens[index]?.text ?? '', dialect) !== 'cd') return undefined
-  const target = tokens.slice(index + 1).find(token => !token.text.startsWith('-') && token.text !== '')
+  const verb = normalizeVerb(tokens[index]?.text ?? '', dialect)
+  if (verb !== 'cd' && verb !== 'chdir' && verb !== 'pushd') return undefined
+  const target = tokens.slice(index + 1).find(token => !isSwitchToken(token.text, dialect) && token.text !== '' && token.text !== '-')
   if (target === undefined) return undefined
   const expanded = expandVariables(stripQuotes(target.text), ctx)
   if (expanded.unresolved.length > 0) return undefined
@@ -508,9 +821,10 @@ function blanketHit(verb) {
 /** Is this verb one that can change or remove files? */
 function isMutationVerb(verb) {
   if (verb === '') return false
-  if (verb === 'git') return true
+  if (verb === 'git' || verb === 'forfiles') return true
   return POSIX_DELETE.has(verb) || WIN_DELETE.has(verb) || POSIX_MOVE.has(verb) || WIN_MOVE.has(verb)
-    || WIN_WRITE.has(verb) || POSIX_TRUNCATE.has(verb) || blanketHit(verb) !== undefined
+    || WIN_WRITE.has(verb) || POSIX_TRUNCATE.has(verb) || COPY_VERBS.has(verb)
+    || blanketHit(verb) !== undefined || SYSTEM_COMMANDS.some(candidate => candidate.verb === verb)
 }
 
 /**
@@ -613,10 +927,32 @@ function scanSegment({ segment, dialect, cwd, ctx, sessionRoot, findings, notes,
     }
   }
   const args = tokens.slice(index + 1)
+  const argTexts = args.map(token => token.text.toLowerCase())
+  // A user may name a command as allowed (`allowCommands: [mountvol]`) because a
+  // form-only finding has no path for `allowExtra` to match.
+  const verbAllowed = Array.isArray(ctx.allowCommands) && ctx.allowCommands.includes(verb)
 
   const blanket = blanketHit(verb)
-  if (blanket !== undefined) {
+  if (blanket !== undefined && !verbAllowed) {
     findings.push({ tier: blanket.tier, id: blanket.id, verb, path: undefined, raw: verbToken.text, note: blanket.note })
+  }
+
+  // Commands that damage the boot chain or a volume's metadata without naming a
+  // file to delete. They are judged by form, because the same tool is harmless
+  // in its read-only form: `bcdedit /enum` prints, `bcdedit /delete` is a machine
+  // that will not start.
+  const systemCommand = SYSTEM_COMMANDS.find(candidate => candidate.verb === verb)
+  if (systemCommand !== undefined && !verbAllowed && systemCommand.danger(argTexts)) {
+    findings.push({ tier: 'system', id: systemCommand.id, verb, path: undefined, raw: verbToken.text, note: systemCommand.note })
+    if (systemCommand.classifyPaths === true) {
+      // The paths such a command names are being *written*, not deleted, and they
+      // are named in the message like any other operand.
+      for (const token of args) {
+        if (token.redirection === true || isSwitchToken(token.text, dialect) || isNoise(token.text) || token.text.includes('=')) continue
+        findings.push(...classifyOperand({ raw: token.text, alt: token.raw, cwd, ctx, sessionRoot, verb, via: 'operand', fs, resolveSymlinksInsideWorkspace, op: 'overwrite' }))
+      }
+    }
+    return
   }
 
   const isDeleteVerb = POSIX_DELETE.has(verb) || WIN_DELETE.has(verb)
@@ -706,10 +1042,78 @@ function scanSegment({ segment, dialect, cwd, ctx, sessionRoot, findings, notes,
     return
   }
 
+  // Copy-like commands do not delete, but they do overwrite their destination.
+  // `robocopy /MIR` is the dangerous one: it mirrors a source over a destination
+  // and removes everything the source does not have.
+  if (COPY_VERBS.has(verb)) {
+    const { operands } = collectOperands(args, dialect)
+    if (verb === 'robocopy') {
+      const mirror = argTexts.includes('/mir') || argTexts.includes('/purge')
+      const moves = argTexts.includes('/mov') || argTexts.includes('/move')
+      const [source, destination] = operands
+      if (mirror && destination !== undefined) {
+        findings.push(...classify(destination.text, { via: 'robocopy /MIR', recursive: true, op: 'delete' }))
+      }
+      else if (protectWrites && destination !== undefined) {
+        findings.push(...classify(destination.text, { via: 'robocopy destination', op: 'overwrite' }))
+      }
+      if (moves && source !== undefined) findings.push(...classify(source.text, { via: 'robocopy /MOVE source', recursive: true, op: 'delete' }))
+      return
+    }
+    const destinationFlag = args.findIndex(token => /^-destination$/i.test(token.text))
+    const destinationToken = destinationFlag >= 0 ? args[destinationFlag + 1] : operands[operands.length - 1]
+    if (protectWrites && destinationToken !== undefined) {
+      findings.push(...classify(destinationToken.text, { via: 'copy destination', op: 'overwrite' }))
+    }
+    return
+  }
+
+  if (verb === 'forfiles') {
+    // `forfiles /p <dir> /c "cmd /c del @path"` runs a delete over a directory
+    // that the command line never spells out as a delete operand.
+    const dirIndex = argTexts.indexOf('/p')
+    const base = dirIndex >= 0 && args[dirIndex + 1] !== undefined ? args[dirIndex + 1].text : '.'
+    const cmdIndex = argTexts.indexOf('/c')
+    const payload = cmdIndex >= 0 ? args.slice(cmdIndex + 1).map(token => token.raw).join(' ') : ''
+    if (payload !== '' && /\b(?:del|erase|rd|rmdir|remove-item|rm)\b/i.test(payload)) {
+      findings.push(...classify(base, { via: 'forfiles /c delete', recursive: argTexts.includes('/s'), op: 'delete' }))
+    }
+    if (payload !== '') {
+      const nested = scanCommand({ command: payload, cwd, dialect: 'cmd', ctx, sessionRoot, fs, resolveSymlinksInsideWorkspace, protectWrites, scanScripts: false })
+      findings.push(...nested.findings)
+    }
+    return
+  }
+
   if (!(isDeleteVerb || isMoveVerb || isWriteVerb || isTruncateVerb)) return
 
   // Operand pass: skip flags, honour `--`, read the truncate/force shape.
+  const { operands, recursive } = collectOperands(args, dialect)
+  for (const operand of operands) {
+    if (isTruncateVerb) {
+      // `truncate -s 0 file` empties the file; any other size is ordinary work.
+      const empty = args.some(candidate => /(^|\D)0[bskmg]?$/.test(candidate.text.toLowerCase())) || args.some(candidate => candidate.text.toLowerCase() === '--empty')
+      if (!empty) continue
+    }
+    findings.push(...classify(operand.text, { alt: operand.raw, via: isMoveVerb ? 'move-source' : 'operand', recursive, op: isWriteVerb ? 'overwrite' : 'delete' }))
+  }
+}
+
+/**
+ * The non-switch operands of a segment, in source order.
+ *
+ * A `cmd` / PowerShell switch may be spelled `/s`, `/MIR` or `/c:`; a path is
+ * never mistaken for one because it carries a second separator. Value-taking
+ * switches consume their value so `New-Item -ItemType Directory` cannot conjure
+ * an operand out of the word `Directory`.
+ *
+ * @param {Array<{ text: string, raw: string, redirection?: boolean }>} args
+ * @param {string} dialect
+ * @returns {{ operands: Array<{ text: string, raw: string }>, recursive: boolean }}
+ */
+function collectOperands(args, dialect) {
   const operands = []
+  const recursiveFlags = new Set(['-r', '-rf', '-fr', '--recursive', '-recurse', '-s', '/s'])
   let afterDoubleDash = false
   let recursive = false
   for (let i = 0; i < args.length; i++) {
@@ -719,24 +1123,17 @@ function scanSegment({ segment, dialect, cwd, ctx, sessionRoot, findings, notes,
     if (token.redirection === true) continue
     if (!afterDoubleDash && text === '--') { afterDoubleDash = true; continue }
     if (!afterDoubleDash) {
-      if (lower === '-r' || lower === '-rf' || lower === '-fr' || lower === '-fr' || lower === '--recursive' || lower === '-recurse' || lower === '-s' || lower === '/s' || lower.startsWith('-r=')) recursive = true
+      if (recursiveFlags.has(lower) || lower.startsWith('-r=')) recursive = true
       // Value-taking switches first: the blanket flag skip below would make this
       // check unreachable, which is how `New-Item -ItemType Directory` once
       // produced a phantom operand out of the word `Directory`.
-      if (VALUE_FLAGS.has(lower)) { i++; continue }
-      if (lower.startsWith('-') || (dialect !== 'sh' && /^\/[a-z]{1,3}$/.test(lower))) continue
-    }
-    if (isTruncateVerb) {
-      const empty = args.some(candidate => /(^|\D)0[bskmg]?$/.test(candidate.text.toLowerCase())) || args.some(candidate => candidate.text.toLowerCase() === '--empty')
-      if (!empty) continue
+      if (VALUE_FLAGS.has(lower)) { i += 1; continue }
+      if (isSwitchToken(text, dialect)) continue
     }
     if (isNoise(text)) continue
     operands.push({ text, raw: token.raw })
   }
-
-  for (const operand of operands) {
-    findings.push(...classify(operand.text, { alt: operand.raw, via: isMoveVerb ? 'move-source' : 'operand', recursive, op: isWriteVerb ? 'overwrite' : 'delete' }))
-  }
+  return { operands, recursive }
 }
 
 /**
@@ -777,20 +1174,15 @@ function classifyOperand({ raw, alt, cwd, ctx, sessionRoot, verb, via, fs, resol
 
     let real
     if (fs !== undefined) {
-      // A link outside the session workspace is resolved before judging, so a
-      // symlink cannot smuggle a protected target past the lexical rules. Inside
-      // the workspace this is opt-in: it costs a syscall per operand.
+      // The real target is resolved before judging, so a link, junction or mount
+      // point cannot smuggle a protected path past the lexical rules. Inside the
+      // workspace this is opt-in: it costs a syscall per operand.
       const insideWorkspace = sessionRoot !== undefined && isWithin(pathKey(sessionRoot, ctx), pathKey(probe, ctx), ctx)
       const wantReal = insideWorkspace ? resolveSymlinksInsideWorkspace === true : true
-      if (wantReal) {
-        try {
-          if (fs.existsSync(probe) && fs.lstatSync(probe).isSymbolicLink()) real = fs.realpathSync(probe)
-        }
-        catch { /* an unstattable path is judged lexically only */ }
-      }
+      if (wantReal) real = resolveExistingPath(probe, ctx, fs)
     }
 
-    const verdict = classifyKey(probe, ctx, { sessionRoot, real })
+    const verdict = classifyKey(probe, ctx, { sessionRoot, real, fs })
     if (verdict === undefined || verdict.tier === 'allow') continue
     judged.push({ verdict, probe, wildcard, unresolved: expanded.unresolved, original, real })
   }

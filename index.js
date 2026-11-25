@@ -31,7 +31,7 @@ import { fileURLToPath } from 'node:url'
 import { createAudit } from './src/audit.js'
 import { askDisplayReason, MODEL_GUIDANCE } from './src/guidance.js'
 import { pathKey } from './src/paths.js'
-import { decideToolCall, formatReason } from './src/policy.js'
+import { decideToolCall, formatReason, selfDisturbance } from './src/policy.js'
 import { classifyKey, TIERS, TIER_LABEL } from './src/rules.js'
 import { scanCommand } from './src/shell-scan.js'
 import { createSystemContext } from './src/system-context.js'
@@ -67,22 +67,25 @@ const DEFAULT_SETTINGS = Object.freeze({
   tiers: DEFAULT_TIERS,
   protectExtra: [],
   allowExtra: [],
+  allowCommands: [],
   protectWrites: true,
   scanShell: true,
+  scanScripts: true,
   genericPathSweep: true,
   resolveSymlinksInsideWorkspace: false,
   exemptTools: DEFAULT_EXEMPT,
+  selfProtect: true,
   sweepTools: [],
   sweepSkipTools: [],
   denyNote: '',
   auditLog: '',
-  onInternalError: 'open',
+  onInternalError: 'closed',
   messageLocale: 'auto',
   modelGuidance: true,
 })
 
-const FLAG_KEYS = ['enabled', 'protectWrites', 'scanShell', 'genericPathSweep', 'resolveSymlinksInsideWorkspace', 'modelGuidance']
-const LIST_KEYS = ['protectExtra', 'allowExtra', 'exemptTools', 'sweepTools', 'sweepSkipTools']
+const FLAG_KEYS = ['enabled', 'protectWrites', 'scanShell', 'scanScripts', 'genericPathSweep', 'resolveSymlinksInsideWorkspace', 'selfProtect', 'modelGuidance']
+const LIST_KEYS = ['protectExtra', 'allowExtra', 'allowCommands', 'exemptTools', 'sweepTools', 'sweepSkipTools']
 
 /**
  * Merge the row's `config` over the defaults, reporting anything unrecognized
@@ -117,7 +120,7 @@ export function normalizeConfig(raw, log) {
   if (typeof source.enforcement === 'string' && (source.enforcement === 'enforce' || source.enforcement === 'audit')) settings.enforcement = source.enforcement
   else if (source.enforcement !== undefined) log.warn('system-protection: config "enforcement" must be "enforce" or "audit"; using enforce')
   if (typeof source.onInternalError === 'string' && (source.onInternalError === 'open' || source.onInternalError === 'closed')) settings.onInternalError = source.onInternalError
-  else if (source.onInternalError !== undefined) log.warn('system-protection: config "onInternalError" must be "open" or "closed"; using open')
+  else if (source.onInternalError !== undefined) log.warn('system-protection: config "onInternalError" must be "open" or "closed"; using closed')
   if (typeof source.messageLocale === 'string' && ['auto', 'en', 'zh'].includes(source.messageLocale)) settings.messageLocale = source.messageLocale
   else if (source.messageLocale !== undefined) log.warn('system-protection: config "messageLocale" must be "auto", "en" or "zh"; using auto')
 
@@ -193,6 +196,7 @@ export function apply(ctx, config) {
     selfDir,
     protectExtra: settings.protectExtra,
     allowExtra: settings.allowExtra,
+    allowCommands: settings.allowCommands,
   })
 
   /** Per-call memo so the ask layer and the guard never scan the same call twice. */
@@ -238,6 +242,7 @@ export function apply(ctx, config) {
       tierActions: settings.tiers,
       protectWrites: settings.protectWrites,
       scanShell: settings.scanShell,
+      scanScripts: settings.scanScripts,
       genericPathSweep: settings.genericPathSweep,
       sweepTools: settings.sweepTools,
       sweepSkipTools: settings.sweepSkipTools,
@@ -248,6 +253,34 @@ export function apply(ctx, config) {
   }
 
   const exempt = (name) => settings.exemptSet.has(name)
+
+  /** Spellings that identify this plugin in a `plugin_manager` call. */
+  const selfNames = ['@local/system-protection', path.basename(selfDir), 'system-protection']
+
+  /**
+   * The one judgement an exempt tool still gets: a call that names this plugin
+   * and switches it off or removes it. The exemption exists so a person can
+   * manage bundles; it must not also let the model disarm the guard.
+   */
+  const selfVeto = (exec, name) => {
+    if (!settings.selfProtect) return undefined
+    const target = selfDisturbance(parsedArguments(exec), selfNames)
+    if (target === undefined) return undefined
+    const decision = {
+      action: 'deny',
+      hits: [{ tier: 'harness', id: 'self:disable', path: selfDir, raw: target.target, via: 'self-protect', op: 'disable' }],
+    }
+    if (settings.enforcement === 'audit') {
+      audit.record({ tool: name, action: 'allow', hits: decision.hits.map(hit => ({ ...hit })) })
+      log.warn(`system-protection audit-only: ${name} would be denied for disabling the protection plugin itself`)
+      return undefined
+    }
+    audit.record({ tool: name, action: 'deny', hits: decision.hits })
+    return {
+      reason: formatReason(decision, { locale: localeOf(settings, ctx), note: settings.denyNote }),
+      info: { name: 'system-protection', code: 'PROTECTED_SELF', reason: `self:disable ${target.target}` },
+    }
+  }
 
   /** Run one decision, containing our own failure according to `onInternalError`. */
   const guarded = (exec, label) => {
@@ -263,7 +296,7 @@ export function apply(ctx, config) {
   // 鈹€鈹€ Layer 1: the hard floor 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
   ctx.effect(() => ctx.tools.guard((exec) => {
     const name = String(exec?.name ?? '')
-    if (exempt(name)) return undefined
+    if (exempt(name)) return selfVeto(exec, name)
     const { ok, decision } = guarded(exec, name)
     if (!ok) return settings.onInternalError === 'closed'
       ? { reason: 'System file protection could not evaluate this call and is configured to fail closed.', info: { name: 'system-protection', code: 'PROTECTION_UNAVAILABLE' } }
@@ -324,19 +357,29 @@ export function apply(ctx, config) {
     if (actor === undefined || actor === null) return undefined
     const raw = hostPathOf(target)
     if (typeof raw !== 'string' || raw === '') return undefined
-    const platform = sysctx.path
-    const sessionRoot = sessionRootOf({ agent: { session: sessionOf(actor) } })
-    const absolute = platform.isAbsolute(raw) ? raw : platform.resolve(sessionRoot, raw)
-    const verdict = classifyKey(pathKey(absolute, sysctx), sysctx, { sessionRoot: pathKey(sessionRoot, sysctx) })
-    if (verdict === undefined || verdict.tier === 'allow') return undefined
-    const action = settings.tiers[verdict.tier] ?? 'off'
-    if (action !== 'deny' || settings.enforcement !== 'enforce') return undefined
-    const decision = {
-      action: 'deny',
-      hits: [{ tier: verdict.tier, id: verdict.id, path: absolute, raw, via: `fs:${op}`, op }],
+    try {
+      const platform = sysctx.path
+      const sessionRoot = sessionRootOf({ agent: { session: sessionOf(actor) } })
+      const absolute = platform.isAbsolute(raw) ? raw : platform.resolve(sessionRoot, raw)
+      const verdict = classifyKey(pathKey(absolute, sysctx), sysctx, { sessionRoot: pathKey(sessionRoot, sysctx), fs })
+      if (verdict === undefined || verdict.tier === 'allow') return undefined
+      const action = settings.tiers[verdict.tier] ?? 'off'
+      if (action !== 'deny' || settings.enforcement !== 'enforce') return undefined
+      const decision = {
+        action: 'deny',
+        hits: [{ tier: verdict.tier, id: verdict.id, path: absolute, raw, via: `fs:${op}`, op }],
+      }
+      audit.record({ tool: `fs:${op}`, action: 'deny', hits: decision.hits })
+      return formatReason(decision, { locale: localeOf(settings, ctx), note: settings.denyNote })
     }
-    audit.record({ tool: `fs:${op}`, action: 'deny', hits: decision.hits })
-    return formatReason(decision, { locale: localeOf(settings, ctx), note: settings.denyNote })
+    catch (error) {
+      // This seam sits below every tool: an exception here must not be a quiet
+      // "yes". Fail closed by default, and say which way the config points.
+      audit.record({ tool: `fs:${op}`, action: 'error', hits: [], message: String(error?.stack ?? error) })
+      return settings.onInternalError === 'closed'
+        ? 'System file protection could not evaluate this file operation and is configured to fail closed.'
+        : undefined
+    }
   }
 
   const intentOptions = { prepend: true }
@@ -396,10 +439,10 @@ export function apply(ctx, config) {
           const sessionRoot = sessionRootOf({ agent })
           const looksLikeCommand = /(?:^|\s)(?:rm|del|rd|rmdir|remove-item|mv|move-item|find|git|xargs)(\s|$)/i.test(rest) || /[;&|`$]/.test(rest)
           const outcome = looksLikeCommand
-            ? scanCommand({ command: rest, cwd: sessionRoot, dialect: /\b(remove-item|del|rd|pwsh|powershell)\b/i.test(rest) ? 'ps' : 'sh', ctx: sysctx, sessionRoot, fs, protectWrites: settings.protectWrites })
+            ? scanCommand({ command: rest, cwd: sessionRoot, dialect: /\b(remove-item|del|rd|pwsh|powershell)\b/i.test(rest) ? 'ps' : 'sh', ctx: sysctx, sessionRoot, fs, protectWrites: settings.protectWrites, scanScripts: settings.scanScripts })
             : { findings: [], notes: ['path mode'] }
           if (!looksLikeCommand) {
-            const verdict = classifyKey(pathKey(rest, sysctx), sysctx, { sessionRoot: pathKey(sessionRoot, sysctx) })
+            const verdict = classifyKey(pathKey(rest, sysctx), sysctx, { sessionRoot: pathKey(sessionRoot, sysctx), fs })
             if (verdict !== undefined) outcome.findings.push({ tier: verdict.tier, id: verdict.id, path: rest, raw: rest, via: 'path' })
           }
           if (outcome.findings.length === 0) return { kind: 'success', text: `system-protection: "${rest}" is not protected. It would run.` }
@@ -415,11 +458,15 @@ export function apply(ctx, config) {
           enforcement: settings.enforcement,
           protectWrites: settings.protectWrites,
           scanShell: settings.scanShell,
+          scanScripts: settings.scanScripts,
+          selfProtect: settings.selfProtect,
+          onInternalError: settings.onInternalError,
           genericPathSweep: settings.genericPathSweep,
           tiers: settings.tiers,
           exemptTools: [...settings.exemptSet],
           protectExtra: settings.protectExtra,
           allowExtra: settings.allowExtra,
+          allowCommands: settings.allowCommands,
           roots: {
             systemRoot: sysctx.roots.systemRoot,
             programFiles: sysctx.roots.programFiles,
@@ -435,6 +482,7 @@ export function apply(ctx, config) {
           kind: 'success',
           text: [
             `system-protection: enabled, ${settings.enforcement}. ${snapshot.total} call(s) inspected, ${snapshot.byAction.deny} denied, ${snapshot.byAction.ask} escalated, ${snapshot.byAction.error} internal error(s).`,
+            `on internal error: ${settings.onInternalError}; shell scripts: ${settings.scanScripts ? 'scanned (bounded)' : 'not scanned'}; self-protection: ${settings.selfProtect ? 'on' : 'off'}`,
             'Tiers:',
             tiers,
             `Recent decisions:\n${recent}`,
@@ -450,7 +498,7 @@ export function apply(ctx, config) {
 
   const denyTiers = Object.entries(settings.tiers).filter(([, action]) => action === 'deny').map(([tier]) => tier)
   const askTiers = Object.entries(settings.tiers).filter(([, action]) => action === 'ask').map(([tier]) => tier)
-  log.info(`system-protection: ${settings.enforcement}; deny=[${denyTiers.join(', ')}]; ask=[${askTiers.join(', ')}]; protectWrites=${settings.protectWrites}; scanShell=${settings.scanShell}; genericSweep=${settings.genericPathSweep}`)
+  log.info(`system-protection: ${settings.enforcement}; deny=[${denyTiers.join(', ')}]; ask=[${askTiers.join(', ')}]; protectWrites=${settings.protectWrites}; scanShell=${settings.scanShell}; scanScripts=${settings.scanScripts}; genericSweep=${settings.genericPathSweep}; onInternalError=${settings.onInternalError}; selfProtect=${settings.selfProtect}`)
   if (sysctx.selfInsideWorkspace) {
     // The one case where the plugin declines to guard its own files, so it is
     // never a silent surprise: someone developing this plugin in its own

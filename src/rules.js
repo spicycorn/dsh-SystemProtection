@@ -12,7 +12,7 @@
  * @module system-protection/rules
  */
 
-import { depthBelow, isVolumeOrRoot, isWithin, pathKey } from './paths.js'
+import { canonicalAlias, depthBelow, isVolumeOrRoot, isWithin, pathKey, uncLocalAlias } from './paths.js'
 
 /** Every tier the plugin can enforce, in the order the manual lists them. */
 export const TIERS = Object.freeze([
@@ -93,7 +93,53 @@ const WINDOWS_FILE_NAMES = [
   'ntuser.dat', 'usrclass.dat', 'bootmgr', 'bootsect.bak', 'ntldr', 'ntdetect.com', 'io.sys',
   'msdos.sys', 'pagefile.sys', 'swapfile.sys', 'hiberfil.sys', 'autoexec.bat', 'config.sys',
   'win.ini', 'system.ini',
+  'bcd', 'boot.sdi', 'bootmgfw.efi', 'bootmgr.efi', 'bootx64.efi', 'bootia32.efi',
+  'winload.efi', 'winresume.efi', 'memtest.efi',
 ]
+
+/**
+ * The boot structures that must stay intact on **every** volume, not only on the
+ * system drive.
+ *
+ * An EFI system partition has no drive letter until someone gives it one, and the
+ * files that boot the machine sit at the root of that partition: `\EFI\…`,
+ * `\bootmgr`, `\Recovery\WindowsRE\winre.wim`. Rules built from a drive-letter
+ * prefix therefore miss it twice — once as `\\?\Volume{…}\EFI\…`, and again after
+ * `mountvol S: /S` hands it the letter `S:`. These are the shapes that are the
+ * same on any volume.
+ */
+const BOOT_DIR_LEAVES = new Map([
+  ['efi', 'system:efi'],
+  ['boot', 'system:boot'],
+  ['recovery', 'system:recovery'],
+  ['$winreagent', 'system:winreagent'],
+  ['system volume information', 'system:volume-information'],
+])
+
+/**
+ * Does this path name a machine-booting structure at the root of a volume?
+ * @param {string} probe comparable path key
+ * @param {{ win: boolean }} ctx
+ * @returns {{ tier: string, id: string } | undefined}
+ */
+export function bootStructureHit(probe, ctx) {
+  if (ctx.win !== true) return undefined
+  const parts = probe.split('\\').filter(part => part !== '')
+  if (parts.length === 0) return undefined
+  let rest = parts
+  if (/^[a-z]:$/.test(parts[0]) || /^volume\{[0-9a-f-]+\}$/i.test(parts[0])) rest = parts.slice(1)
+  // A UNC path names another machine's share; the administrative-share alias
+  // turns a local one into a drive path before this runs.
+  else if (probe.startsWith('\\\\')) return undefined
+  if (rest.length === 0) return undefined
+  const first = rest[0]
+  const leaf = BOOT_DIR_LEAVES.get(first)
+  if (leaf !== undefined) return { tier: 'system', id: leaf }
+  // An offline Windows installation on another volume boots that installation.
+  if (first === 'windows' && rest.some(part => part === 'system32')) return { tier: 'system', id: 'system:windows-volume' }
+  return undefined
+}
+
 
 /**
  * Personal folders, registered in both spellings: a case-sensitive filesystem
@@ -255,7 +301,10 @@ export function classifyPath(absolute, ctx, extra = {}) {
 /**
  * @param {string} key comparable path key
  * @param {ReturnType<import('./system-context.js').createSystemContext>} ctx
- * @param {{ sessionRoot?: string, real?: string, allowOverride?: boolean }} [extra]
+ * @param {{ sessionRoot?: string, real?: string, fs?: Partial<typeof import('node:fs')> }} [extra]
+ *   `sessionRoot` is the calling session's workspace root, `real` the
+ *   symlink-resolved target, `fs` the module used to resolve drive and 8.3-name
+ *   aliases (never used to read a file).
  */
 export function classifyKey(input, ctx, extra = {}) {
   if (input === undefined || input === null || input === '') return undefined
@@ -263,21 +312,36 @@ export function classifyKey(input, ctx, extra = {}) {
   // no-op, so neither side can silently compare mixed-case Windows paths.
   const key = pathKey(input, ctx)
 
-  for (const allow of ctx.allowExtra) {
-    if (allow !== '' && (key === allow || isWithin(allow, key, ctx))) return { tier: 'allow', id: 'allowExtra', key }
-  }
+  const allowed = probe => ctx.allowExtra.some(allow => allow !== '' && (probe === allow || isWithin(allow, probe, ctx)))
+  if (allowed(key)) return { tier: 'allow', id: 'allowExtra', key }
 
-  // The resolved target of a symlink is judged too, so a link cannot smuggle a
-  // protected path past the lexical check.
-  const realKey = extra.real === undefined ? undefined : pathKey(extra.real, ctx)
+  // The same file has more than one spelling. Every one of them is judged, and
+  // the strictest verdict wins, so a spelling cannot be picked to dodge a rule:
+  //   \\localhost\C$\Windows  →  C:\Windows     (this machine's admin share)
+  //   X:\                     →  C:\Windows     (a `subst` or mounted ESP)
+  //   C:\PROGRA~1             →  C:\Program Files (8.3 short name)
+  //   link                    →  its target     (symlink, when the caller resolved it)
+  const probes = [key]
+  const addProbe = value => {
+    if (value === undefined || value === null || value === '') return
+    const probe = pathKey(value, ctx)
+    if (probe !== '' && !probes.includes(probe)) probes.push(probe)
+  }
+  addProbe(uncLocalAlias(key, ctx))
+  addProbe(canonicalAlias(key, ctx, extra.fs))
+  addProbe(extra.real)
+
   const table = rulesFor(ctx)
 
-  const hit = candidate => (candidate === undefined ? undefined : { ...candidate, key })
-  const checkKey = (probe) => {
+  const checkProbe = (probe) => {
     if (probe === undefined) return undefined
-    if (ctx.allowExtra.some(allow => allow !== '' && (probe === allow || isWithin(allow, probe, ctx)))) return { tier: 'allow', id: 'allowExtra', key: probe }
+    if (allowed(probe)) return { tier: 'allow', id: 'allowExtra', key: probe }
 
     if (isVolumeOrRoot(probe, ctx)) return { tier: 'system', id: 'system:volume-root', key: probe }
+    // `\\.\PhysicalDrive0` loses its prefix above and arrives as `physicaldrive0`.
+    if (/^(?:physicaldrive\d+|harddisk\d+)$/.test(probe) || probe.startsWith('device\\harddisk')) {
+      return { tier: 'system', id: 'system:device', key: probe }
+    }
     if (ctx.roots.home !== '' && (probe === ctx.roots.home || probe === `${ctx.roots.home}${ctx.win ? '\\' : '/'}`)) {
       return { tier: 'homeRoot', id: 'home:root', key: probe }
     }
@@ -287,6 +351,11 @@ export function classifyKey(input, ctx, extra = {}) {
     if (sessionRoot !== undefined && (probe === sessionRoot || isWithin(probe, sessionRoot, ctx))) {
       return { tier: 'workspaceRoot', id: 'workspace:root-or-ancestor', key: probe }
     }
+
+    // Boot structures are the same on every volume, so they are checked before
+    // the per-drive trees: an EFI system partition, an offline Windows install.
+    const boot = bootStructureHit(probe, ctx)
+    if (boot !== undefined) return { ...boot, key: probe }
 
     // A tree rule outranks a name rule: `C:\Windows\System32\ntuser.dat` is the
     // system first, and `~/.ssh/id_ed25519` is the credential tree, not merely
@@ -324,12 +393,24 @@ export function classifyKey(input, ctx, extra = {}) {
     return undefined
   }
 
-  const lexical = checkKey(key)
-  if (lexical === undefined && realKey !== undefined) {
-    const resolved = checkKey(realKey)
-    return resolved === undefined ? undefined : { ...resolved, viaSymlink: true }
+  const verdicts = []
+  for (const probe of probes) {
+    const verdict = checkProbe(probe)
+    if (verdict !== undefined) verdicts.push(verdict)
   }
-  return hit(lexical)
+  if (verdicts.length === 0) return undefined
+  // An explicit allowExtra entry is the user's decision and beats a tier, even
+  // when a second spelling of the same file would land in that tier.
+  const allowedVerdict = verdicts.find(verdict => verdict.tier === 'allow')
+  if (allowedVerdict !== undefined) return allowedVerdict
+  verdicts.sort((left, right) => (TIER_RANK[right.tier] ?? 0) - (TIER_RANK[left.tier] ?? 0))
+  const best = verdicts[0]
+  const resolved = best.key !== key
+  return {
+    ...best,
+    key,
+    ...(resolved ? { viaAlias: true, resolvedKey: best.key } : {}),
+  }
 }
 
 /**

@@ -4,9 +4,15 @@
  * The claim under test is narrow and checkable: the plugin only ever answers a
  * DSH tool call with allow / ask / deny. It does not touch the file system apart
  * from metadata lookups on the exact paths a call named (plus one append to an
- * audit log the user opted into), it never reads file contents, never enumerates
- * a directory, never spawns a process, never opens a socket, and leaves no
- * global state behind when it is disposed.
+ * audit log the user opted into), it never enumerates a directory, never spawns
+ * a process, never opens a socket, and leaves no global state behind when it is
+ * disposed.
+ *
+ * One deliberate exception, added in 1.1.0: a script file the call itself names
+ * (`pwsh -File cleanup.ps1`, `bash ./build.sh`, `python tools/x.py`) is read so
+ * its text can be scanned before it runs — bounded to 256 KiB, at most eight
+ * files, never a directory listing, and switchable off with `scanScripts: false`.
+ * The assertions below pin exactly that: the only content reads are those files.
  *
  * Method: every function on `node:fs`, `node:fs/promises`, `node:child_process`,
  * `node:net`, and `node:http` is replaced with a recording proxy *before* the
@@ -28,10 +34,26 @@ import path from 'node:path'
 import process from 'node:process'
 
 import { apply } from '../index.js'
-import { createHost, PROGRAM_FILES, SYSTEM_TARGET, WORKSPACE } from './host.mjs'
+import { createHost, isWin, PROGRAM_FILES, SYSTEM_TARGET, WORKSPACE } from './host.mjs'
 
 /** The only calls the plugin may make against the file system. */
 const METADATA = new Set(['existsSync', 'lstatSync', 'statSync', 'lstat', 'stat', 'realpathSync', 'realpath', 'access', 'accessSync'])
+/** The one content read 1.1.0 allows: the text of a script the call named. */
+const SCRIPT_READ = new Set(['readFileSync'])
+
+/**
+ * The script every run tries to execute, and the only file the plugin may read.
+ * It is created before the instrumentation starts, so it is not mistaken for a
+ * write by the plugin.
+ */
+const SCRIPT_NAME = isWin ? 'cleanup.ps1' : 'cleanup.sh'
+const SCRIPT_PATH = path.join(WORKSPACE, SCRIPT_NAME)
+const SCRIPT_BODY = isWin
+  ? `Remove-Item -Recurse -Force ${SYSTEM_TARGET}\n`
+  : `rm -rf ${SYSTEM_TARGET}\n`
+const SCRIPT_COMMAND = isWin
+  ? `pwsh -File "${SCRIPT_PATH}"`
+  : `sh "${SCRIPT_PATH}"`
 
 const calls = []
 const violations = []
@@ -130,6 +152,7 @@ const HOSTILE = [
   ['move', { source: SYSTEM_TARGET, destination: '/tmp/x' }],
   ['terminal_send', { sessionId: 's', text: `rm -rf ${SYSTEM_TARGET}` }],
   ['run_code', { code: `import shutil\nshutil.rmtree("${SYSTEM_TARGET}")` }],
+  ['pwsh', { command: SCRIPT_COMMAND }],
   ['bash', { command: 'rm -rf ./build' }],
   ['write', { file_path: 'src/index.js', content: 'x' }],
   ['read', { file_path: `${SYSTEM_TARGET}/hosts` }],
@@ -165,6 +188,9 @@ const handlesBefore = process._getActiveHandles?.().length ?? 0
 // is the only file-system mutation in the whole run.
 fs.mkdirSync(path.dirname(AUDIT_LOG), { recursive: true })
 if (fs.existsSync(AUDIT_LOG)) fs.rmSync(AUDIT_LOG)
+// ...and the script the hostile calls run, so reading it is not a write.
+fs.mkdirSync(path.dirname(SCRIPT_PATH), { recursive: true })
+fs.writeFileSync(SCRIPT_PATH, SCRIPT_BODY)
 
 instrument(fs, 'node:fs')
 instrument(fsPromises, 'node:fs/promises')
@@ -191,7 +217,10 @@ const phaseAWrites = distinctWrites(calls)
 const observed = {}
 for (const record of calls) observed[`${record.module}.${record.method}`] = (observed[`${record.module}.${record.method}`] ?? 0) + 1
 const seenMethods = new Set(calls.map(record => `${record.module}.${record.method}`))
-const outsideAllowList = [...seenMethods].filter(method => !METADATA.has(method.split('.').pop()))
+const outsideAllowList = [...seenMethods].filter(method => {
+  const name = method.split('.').pop()
+  return !METADATA.has(name) && !SCRIPT_READ.has(name)
+})
 
 check('phase A attempted no write-shaped call at all', () => {
   assert.deepEqual(phaseAWrites.map(record => `${record.module}.${record.method}`), [])
@@ -206,8 +235,14 @@ check('no child process was spawned', () => {
 check('no socket was opened', () => {
   assert.equal(calls.filter(record => record.module === 'node:net' || record.module === 'node:http').length, 0)
 })
-check('no file content was read and no directory was listed', () => {
-  for (const record of calls) assert.doesNotMatch(record.method, /^(read|readdir|opendir|createReadStream)/, `${record.module}.${record.method}`)
+check('no file content was read except the script the call itself named, and no directory was listed', () => {
+  const reads = calls.filter(record => /^(read|readdir|opendir|createReadStream)/.test(record.method))
+  for (const record of reads) {
+    assert.equal(record.method, 'readFileSync', `${record.module}.${record.method} is not a bounded script read`)
+    assert.equal(path.resolve(String(record.args[0])), path.resolve(SCRIPT_PATH), `read ${record.args[0]}`)
+  }
+  // …and it really did read that script, so this check is not vacuous.
+  assert.ok(reads.length > 0, 'the script scan never happened, so the audit proved nothing')
 })
 check('the plugin was actually exercised', () => {
   assert.ok(calls.length > 0, 'expected metadata lookups on the paths named by the calls')
@@ -265,6 +300,18 @@ check('the audit log lives in the directory the user chose, not a protected tree
 check('the default configuration writes nothing anywhere', () => {
   assert.equal(phaseAWrites.length, 0)
   assert.ok(phaseBWrites.length > 0, 'and the opt-in configuration does, so the probe works')
+})
+
+calls.length = 0
+violations.length = 0
+
+// ── Phase C: script inspection is the owner's switch ────────────────────────
+const phaseC = createHost()
+apply(phaseC.ctx, { scanScripts: false })
+phaseC.runGuards('pwsh', { command: SCRIPT_COMMAND })
+phaseC.disposeAll()
+check('scanScripts: false reads nothing at all', () => {
+  assert.deepEqual(calls.filter(record => /^(read|readdir)/.test(record.method)).map(record => record.method), [])
 })
 
 // The audit log is the plugin's only artefact; confirm it is plain JSONL text.

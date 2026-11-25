@@ -13,7 +13,7 @@
 
 import assert from 'node:assert/strict'
 
-import { DEFAULT_TIERS } from '../index.js'
+import { DEFAULT_TIERS, normalizeConfig } from '../index.js'
 import { decideToolCall, parsePatchTargets } from '../src/policy.js'
 import { scanCommand } from '../src/shell-scan.js'
 import { createSystemContext } from '../src/system-context.js'
@@ -55,7 +55,7 @@ const nix = createSystemContext({
 let passed = 0
 const failures = []
 
-/** @param {{ platform: 'win32'|'linux', name: string, args: object, action: string, tier?: string, ctx?: object, tiers?: object, allowExtra?: string[] }} testCase */
+/** @param {{ platform: 'win32'|'linux', name: string, args: object, action: string, tier?: string, ctx?: object, tiers?: object, allowExtra?: string[], fs?: object, scanScripts?: boolean }} testCase */
 function toolCall(testCase) {
   const base = testCase.ctx ?? (testCase.platform === 'win32' ? win : nix)
   const context = testCase.allowExtra === undefined
@@ -66,9 +66,11 @@ function toolCall(testCase) {
     args: testCase.args,
     ctx: context,
     sessionRoot: testCase.sessionRoot ?? base.cwd,
+    fs: testCase.fs,
     tierActions: testCase.tiers ?? DEFAULT_TIERS,
     protectWrites: true,
     scanShell: true,
+    scanScripts: testCase.scanScripts ?? true,
     genericPathSweep: true,
     resolveSymlinksInsideWorkspace: false,
   })
@@ -492,6 +494,186 @@ for (const command of ['Remove-Item .\\dist\\*', 'Remove-Item -Recurse -Force .\
   assert.equal(decideWin(command).action, 'allow', `${command} is workspace cleanup`)
   passed += 1
 }
+
+// ── The 2026-11-25 evaluation report: every finding pinned ──────────────────
+// The report was written against 1.0.0 by attacking the *installed* plugin on a
+// UEFI machine. Each probe below is one of its findings; a pass means the finding
+// cannot come back without a test failing.
+
+/** A tiny in-memory file system: enough for 8.3 names, drive aliases and scripts. */
+function virtualFs(entries) {
+  const files = new Map(Object.entries(entries).map(([key, value]) => [key.toLowerCase(), value]))
+  const exists = (target) => {
+    const lower = String(target).toLowerCase()
+    if (files.has(lower)) return true
+    const head = lower.endsWith('\\') ? lower : `${lower}\\`
+    return [...files.keys()].some(key => key.startsWith(head))
+  }
+  const real = (target) => {
+    const entry = files.get(String(target).toLowerCase())
+    return entry?.alias ?? String(target)
+  }
+  const fsx = {
+    existsSync: exists,
+    statSync: (target) => {
+      const entry = files.get(String(target).toLowerCase())
+      if (entry === undefined) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' })
+      return { isFile: () => entry.text !== undefined, size: entry.text === undefined ? 0 : Buffer.byteLength(entry.text) }
+    },
+    readFileSync: (target) => {
+      const entry = files.get(String(target).toLowerCase())
+      if (entry === undefined) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' })
+      return entry.text ?? ''
+    },
+    lstatSync: () => ({ isSymbolicLink: () => false }),
+  }
+  fsx.realpathSync = Object.assign(real, { native: real })
+  return fsx
+}
+
+const reportCtx = createSystemContext({ ...snapshotOf(win), hostname: 'testpc' })
+const reportFs = virtualFs({
+  'c:\\': { dir: true },
+  'c:\\windows': { dir: true },
+  'c:\\windows\\system32': { dir: true },
+  'c:\\program files': { dir: true },
+  'c:\\progra~1': { alias: 'C:\\Program Files' },
+  'c:\\x': { dir: true },
+  'c:\\x\\system32\\drivers\\etc\\hosts': { text: 'x', alias: 'C:\\Windows\\System32\\drivers\\etc\\hosts' },
+  'x:\\': { alias: 'C:\\Windows' },
+  'c:\\work': { dir: true },
+  'c:\\work\\cleanup.ps1': { text: 'Remove-Item -Recurse -Force C:\\Windows\\System32\\config\n' },
+  'c:\\work\\build.ps1': { text: 'Write-Host "building"\nRemove-Item -Recurse -Force .\\dist\n' },
+  'c:\\work\\cleanup.bat': { text: 'del /f /s /q C:\\Windows\\System32\\drivers\\etc\\hosts\n' },
+})
+
+const decideReport = (name, args) => decideToolCall({
+  name,
+  args: typeof args === 'string' ? { command: args } : args,
+  ctx: reportCtx,
+  sessionRoot: WIN_CWD,
+  fs: reportFs,
+  tierActions: DEFAULT_TIERS,
+  protectWrites: true,
+  scanShell: true,
+  scanScripts: true,
+  genericPathSweep: true,
+  resolveSymlinksInsideWorkspace: false,
+})
+
+for (const [label, command] of [
+  // P1: boot configuration and partition commands name no file to delete.
+  ['bcdedit /delete', 'bcdedit /delete {current} /f'],
+  ['bcdedit /set device', 'bcdedit /set {default} device unknown'],
+  ['bcdedit /set path', 'bcdedit /set {default} path \\nonexistent'],
+  ['mbr2gpt', 'mbr2gpt /convert /allowFullOS'],
+  ['bootrec /fixmbr', 'bootrec /fixmbr'],
+  ['bootrec /fixboot', 'bootrec /fixboot'],
+  ['reagentc /disable', 'reagentc /disable'],
+  ['bcdboot', 'bcdboot C:\\Windows /s S: /f UEFI'],
+  ['bootsect', 'bootsect /nt60 SYS'],
+  ['mountvol /S', 'mountvol S: /S'],
+  ['mountvol volume spec', 'mountvol S: \\\\?\\Volume{11111111-2222-3333-4444-555555555555}\\'],
+  ['switches packed into one argument', "Start-Process bcdedit -ArgumentList '/delete {current} /f'"],
+  ['mountvol behind Start-Process', "Start-Process mountvol -ArgumentList 'S: /S'"],
+]) {
+  const verdict = decideReport('pwsh', command)
+  if (verdict.action !== 'deny' || !verdict.hits.some(hit => hit.tier === 'system')) failures.push(`report P1 ${label}: ${verdict.action} ${JSON.stringify(verdict.hits)}`)
+  else passed += 1
+}
+
+// P2: `fsutil file setzerodata` rewrites a system file's contents.
+toolCall({ platform: 'win32', ctx: reportCtx, fs: reportFs, name: 'pwsh', args: shell('fsutil file setzerodata offset=0 length=4096 C:\\Windows\\System32\\ntoskrnl.exe'), action: 'deny', tier: 'system' })
+
+// P3: an EFI system partition reached through its volume GUID.
+toolCall({ platform: 'win32', ctx: reportCtx, fs: reportFs, name: 'pwsh', args: shell('del /f /q "\\\\?\\Volume{00000000-0000-0000-0000-000000000000}\\EFI\\Microsoft\\Boot\\BCD"'), action: 'deny', tier: 'system' })
+toolCall({ platform: 'win32', ctx: reportCtx, fs: reportFs, name: 'pwsh', args: shell('rm -rf "\\\\?\\Volume{00000000-0000-0000-0000-000000000000}\\EFI"'), action: 'deny', tier: 'system' })
+
+// P4: the same partition after `mountvol S: /S` gives it the letter S:.
+toolCall({ platform: 'win32', ctx: reportCtx, fs: reportFs, name: 'bash', args: shell('del /f /q S:\\EFI\\Microsoft\\Boot\\BCD'), action: 'deny', tier: 'system' })
+toolCall({ platform: 'win32', ctx: reportCtx, fs: reportFs, name: 'bash', args: shell('rm -rf S:\\EFI'), action: 'deny', tier: 'system' })
+
+// P5: `cd /d … && del <relative>` inside cmd /c.
+toolCall({ platform: 'win32', ctx: reportCtx, fs: reportFs, name: 'pwsh', args: shell('cmd /c "cd /d C:\\Windows\\System32 && del __dsh_probe_nonexistent_7f3a__.dll & echo BYPASS_CONFIRMED"'), action: 'deny', tier: 'system' })
+toolCall({ platform: 'win32', ctx: reportCtx, fs: reportFs, name: 'bash', args: shell('cmd /c "cd /d C:\\Windows\\System32 && del __dsh_probe_nonexistent_7f3a__.dll"'), action: 'deny', tier: 'system' })
+
+// P6: an 8.3 short name is the same directory as its long name.
+toolCall({ platform: 'win32', ctx: reportCtx, fs: reportFs, name: 'pwsh', args: shell('cmd /c "del C:\\PROGRA~1\\__dsh_probe_nonexistent_7f3a__.txt & echo BYPASS_SHORTNAME"'), action: 'deny', tier: 'system' })
+toolCall({ platform: 'win32', ctx: reportCtx, fs: reportFs, name: 'write', args: { file_path: 'C:\\PROGRA~1\\__dsh_probe_nonexistent_7f3a__.txt', content: 'x' }, action: 'deny', tier: 'system' })
+
+// P7: this machine's administrative shares are the local volumes.
+for (const command of [
+  'del /f /q \\\\localhost\\C$\\Windows\\System32\\drivers\\etc\\hosts',
+  'del /f /q \\\\TESTPC\\C$\\Windows\\System32\\drivers\\etc\\hosts',
+  'del /f /q \\\\localhost\\ADMIN$\\System32\\drivers\\etc\\hosts',
+  'del /f /q \\\\?\\UNC\\localhost\\C$\\Windows\\System32\\drivers\\etc\\hosts',
+]) {
+  toolCall({ platform: 'win32', ctx: reportCtx, fs: reportFs, name: 'pwsh', args: shell(command), action: 'deny', tier: 'system' })
+}
+toolCall({ platform: 'win32', ctx: reportCtx, fs: reportFs, name: 'write', args: { file_path: '\\\\localhost\\C$\\Windows\\__probe__.txt', content: 'x' }, action: 'deny', tier: 'system' })
+toolCall({ platform: 'win32', ctx: reportCtx, fs: reportFs, name: 'pwsh', args: shell('del /f /q \\\\other-pc\\C$\\Windows\\System32\\drivers\\etc\\hosts'), action: 'allow' })
+
+// P8: a `subst` drive letter — and a junction — point at the same volume.
+toolCall({ platform: 'win32', ctx: reportCtx, fs: reportFs, name: 'pwsh', args: shell('del X:\\System32\\drivers\\etc\\hosts'), action: 'deny', tier: 'system' })
+toolCall({ platform: 'win32', ctx: reportCtx, fs: reportFs, name: 'write', args: { file_path: 'C:\\x\\System32\\drivers\\etc\\hosts', content: 'x' }, action: 'deny', tier: 'system' })
+
+// P9: a script is read (bounded) and scanned before it runs.
+toolCall({ platform: 'win32', ctx: reportCtx, fs: reportFs, name: 'pwsh', args: shell('pwsh -File C:\\work\\cleanup.ps1'), action: 'deny', tier: 'system' })
+toolCall({ platform: 'win32', ctx: reportCtx, fs: reportFs, name: 'pwsh', args: shell('. C:\\work\\cleanup.ps1'), action: 'deny', tier: 'system' })
+toolCall({ platform: 'win32', ctx: reportCtx, fs: reportFs, name: 'pwsh', args: shell('cmd /c C:\\work\\cleanup.bat'), action: 'deny', tier: 'system' })
+toolCall({ platform: 'win32', ctx: reportCtx, fs: reportFs, name: 'pwsh', args: shell('pwsh -File C:\\work\\build.ps1'), action: 'allow' })
+toolCall({ platform: 'win32', ctx: reportCtx, fs: reportFs, name: 'pwsh', args: shell('pwsh -File C:\\work\\cleanup.ps1'), action: 'allow', scanScripts: false })
+
+// P10: mirroring and batch deletion are deletes even though the verb is not `del`.
+toolCall({ platform: 'win32', ctx: reportCtx, fs: reportFs, name: 'pwsh', args: shell('robocopy C:\\empty C:\\Windows /MIR /NFL /NDL'), action: 'deny', tier: 'system' })
+toolCall({ platform: 'win32', ctx: reportCtx, fs: reportFs, name: 'pwsh', args: shell('forfiles /p C:\\Windows\\System32\\drivers\\etc /c "cmd /c del @path"'), action: 'deny', tier: 'system' })
+toolCall({ platform: 'win32', ctx: reportCtx, fs: reportFs, name: 'pwsh', args: shell('robocopy C:\\src D:\\backup /MIR'), action: 'allow' })
+toolCall({ platform: 'win32', ctx: reportCtx, fs: reportFs, name: 'pwsh', args: shell('forfiles /p .\\out /c "cmd /c echo @file"'), action: 'allow' })
+
+// P12: a protection component that cannot make up its mind must say no.
+const quietLog = { warn: () => {}, info: () => {} }
+assert.equal(normalizeConfig({}, quietLog).onInternalError, 'closed', 'onInternalError must default to closed')
+passed += 1
+assert.equal(normalizeConfig({ onInternalError: 'nonsense' }, quietLog).onInternalError, 'closed', 'a bad value must keep the strict default')
+passed += 1
+
+// The fixes above must not turn ordinary work into a denial.
+for (const [label, command] of [
+  ['bcdedit /enum', 'bcdedit /enum'],
+  ['bootrec /scanos', 'bootrec /scanos'],
+  ['reagentc /info', 'reagentc /info'],
+  ['mountvol list', 'mountvol'],
+  ['mountvol drive list', 'mountvol C: /L'],
+  ['fsutil volume diskfree', 'fsutil volume diskfree C:'],
+  ['robocopy without mirror', 'robocopy C:\\empty D:\\backup /E'],
+  ['cp into dist', 'cp .\\app.exe .\\dist\\'],
+  ['cd /d workspace', 'cmd /c "cd /d C:\\projects\\demo && del out.txt"'],
+  ['delete a script', 'rm -f C:\\work\\cleanup.ps1'],
+  ['list a script', 'ls C:\\work\\cleanup.ps1'],
+]) {
+  const verdict = decideReport('pwsh', command)
+  if (verdict.action !== 'allow') failures.push(`report control ${label}: expected allow, got ${verdict.action} ${JSON.stringify(verdict.hits)}`)
+  else passed += 1
+}
+
+// A form-only denial has no path for `allowExtra` to match, so the user gets one
+// explicit switch for the command itself.
+const allowMountvol = createSystemContext({ ...snapshotOf(reportCtx), allowCommands: ['mountvol'] })
+const mountvolAllowed = decideToolCall({
+  name: 'pwsh',
+  args: shell('mountvol S: /S'),
+  ctx: allowMountvol,
+  sessionRoot: WIN_CWD,
+  fs: reportFs,
+  tierActions: DEFAULT_TIERS,
+  protectWrites: true,
+  scanShell: true,
+  scanScripts: true,
+  genericPathSweep: true,
+  resolveSymlinksInsideWorkspace: false,
+})
+assert.equal(mountvolAllowed.action, 'allow', `allowCommands: ${JSON.stringify(mountvolAllowed.hits)}`)
+passed += 1
 
 console.log(`system-protection selftest: ${passed} checks passed, ${failures.length} failed`)
 for (const failure of failures) console.error(`FAIL ${failure}`)

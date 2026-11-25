@@ -48,12 +48,28 @@ function expandForCompare(value, seed) {
 }
 
 /**
+ * The machine name from the running process, if it exposes one.
+ * @param {{ hostname?: () => string } | undefined} runtime
+ * @returns {string | undefined}
+ */
+function runtimeHostname(runtime) {
+  try {
+    const value = runtime?.hostname?.()
+    return typeof value === 'string' ? value : undefined
+  }
+  catch {
+    return undefined
+  }
+}
+
+/**
  * Build the protection context.
  *
  * @param {{
  *   platform?: string,
  *   env?: Record<string, string | undefined>,
  *   homedir?: string,
+ *   hostname?: string,
  *   cwd?: string,
  *   path?: typeof import('node:path'),
  *   harness?: { installDir?: string, profileDir?: string, homeDir?: string },
@@ -105,6 +121,28 @@ export function createSystemContext(options = {}) {
   const homeKey = pathKey(homedir, { insensitive, path: pathModule })
   const parentOfHome = pathModule.dirname(homedir)
 
+  // Names that mean *this* machine in a UNC path. `\\localhost\C$\Windows` and
+  // `\\<computer-name>\C$\Windows` reach the local volume, so they need the same
+  // rules as `C:\Windows`; a share on another machine stays a network path.
+  const hostNames = [...new Set(
+    [
+      options.hostname,
+      readEnv(env, 'COMPUTERNAME', insensitive),
+      runtimeHostname(runtime),
+      os.hostname(),
+      'localhost',
+      '127.0.0.1',
+      '::1',
+      '.',
+    ]
+      .filter(candidate => typeof candidate === 'string' && candidate.trim() !== '')
+      .flatMap(candidate => {
+        const lower = candidate.trim().toLowerCase()
+        return [lower, lower.split('.')[0]]
+      })
+      .filter(candidate => candidate !== ''),
+  )]
+
   const ctx = {
     platform,
     family,
@@ -114,6 +152,8 @@ export function createSystemContext(options = {}) {
     homedir,
     cwd,
     win,
+    /** Lower-cased spellings that name this machine in a UNC path. */
+    hostNames,
     /** Well-known roots in comparable {@link pathKey} form; undefined when unknown. */
     roots: {
       home: homeKey,
@@ -139,6 +179,12 @@ export function createSystemContext(options = {}) {
     /** User-declared prefixes, already comparable. */
     protectExtra: (options.protectExtra ?? []).map(value => pathKey(expandForCompare(value, seed), { insensitive, path: pathModule })),
     allowExtra: (options.allowExtra ?? []).map(value => pathKey(expandForCompare(value, seed), { insensitive, path: pathModule })),
+    /**
+     * Commands the user explicitly permits even though they change the machine
+     * with no path to name (`mountvol`, `bcdboot`, …). Lower-cased verbs.
+     * `allowExtra` cannot open one of those findings: there is no path to match.
+     */
+    allowCommands: (options.allowCommands ?? []).map(value => String(value).trim().toLowerCase()).filter(value => value !== ''),
   }
 
   // Not a classification decision — only the plugin noticing its own situation,
