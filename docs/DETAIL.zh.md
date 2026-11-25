@@ -38,7 +38,7 @@
 
 ## 1.1.0 的修是怎么来的
 
-第二次测评（[`system-protection-测评报告-2026-11-25.md`](system-protection-测评报告-2026-11-25.md)）是在一台 UEFI 机器上、以 `danger-full-access` 会话打的安装版 1.0.0。结论是：按路径删的覆盖得不错，**不靠路径**毁机器的路子基本没覆盖。下面每条现在都有测试钉住。
+第一次测评（1.0.0，2026-11-25）是在一台 UEFI 机器上、以 `danger-full-access` 会话打的安装版 1.0.0。结论是：按路径删的覆盖得不错，**不靠路径**毁机器的路子基本没覆盖。下面每条现在都有测试钉住。
 
 - **引导配置根本不在扫描范围里。** `bcdedit /delete {current} /f`、`bootrec /fixmbr`、`bcdboot`、`bootsect`、`mbr2gpt`、`reagentc /disable`、`mountvol S: /S`、`fsutil file setzerodata … ntoskrnl.exe` 全被放行，因为它们都没有"要删的路径"这个参数。现在按命令名与形态拒绝；只读形态（`bcdedit /enum`、`reagentc /info`、不带参数的 `mountvol`）照常放行，需要放行某条命令时用 `allowCommands`。
 - **EFI 系统分区没有盘符。** `\\?\Volume{…}\EFI\Microsoft\Boot\BCD`、以及 `mountvol S: /S` 之后的 `S:\EFI\…`，都不匹配任何盘符规则。现在"引导结构"——`\EFI`、`\boot`、`\Recovery`、`\$WinREAgent`、`\System Volume Information`、别的卷上的离线 `\Windows\System32`——在**每个卷**上都被识别，卷 GUID 根本身也算卷根。
@@ -80,8 +80,36 @@
 
 反过来的情形也值得知道，它是真实会话里撞出来并已修掉的：插件会保护自己的源码，免得模型把保护层本身删掉来解除限制。但当插件目录正好落在会话工作区内部 —— `link:` 安装且正在开发时就是这个形状 —— 这条规则会把整棵树里的正常编辑一并拦下，所以它此时让位给工作区，并在启动日志里明确说明自我保护已暂停。系统、凭据、Harness、版本控制这些根的保护不变；正常安装的副本在 profile 目录下，仍由 `harness:profile` 守着。
 
+**另一个方向同样重要，1.2.0 修的就是它**：Harness 根也可能**包含**工作区 —— 便携版默认布局就是把 `workspace` 放在可执行文件旁边。这时 harness 规则只对"确实在工作区内"的目标让位：工作区可以正常产出文件，而可执行文件、`resources`、profile 以及安装树其余部分仍然拒绝，工作区根目录本身仍按 `workspaceRoot` 拒绝；工作区里被人放了一个 junction 也不行，会先解析真实祖先路径再判断。另外，仅"模拟另一个平台"的上下文不再借用宿主机的 `execPath` —— 那会把 Windows 路径经 `path.posix` 变成 `.`、再折叠成 `/`，把模拟 Linux 上的所有路径都保护起来。
+
+## 1.2.0 的修是怎么来的
+
+第二次测评（[`系统保护插件测评报告-2026-11-25.md`](系统保护插件测评报告-2026-11-25.md)）是在便携版布局的 Desktop 宿主上做的。结论很直接：硬拦截是有效的，但插件有一个严重误伤和几条轻易能绕过的写法。
+
+- **工作区整个不可用。** `D:\DeepSeek Harness\workspace` 被判成 `harness:install`，于是 `write`、`edit`、工作区内删除全部被拒 —— 插件让会话连一个文件都产不出来。让位规则当时只处理了反方向。现按上面的方式修复，并把可执行文件、`resources`、工作区根、以及 junction 逃逸都钉成测试。
+- **自带测试在 Desktop 运行时下失败**，因为模拟 Linux 的上下文借用了宿主的 `execPath`。现在只有宿主平台（或测试显式注入 runtime）才使用宿主可执行文件，并且拒绝 `appRootOf` 产生的相对路径。
+- **PowerShell 语法被误当成路径。** `$_.FullName`、`@('a','b')`、`$(…)`、`(Get-Item x).FullName`、`{ … }` 都被读成相对路径（在安装树里就会被拒）。现在识别为表达式；无法从文本解析的变量直接跳过，而不是凭空造出一个文件。脚本里的注释也会先剥掉再扫描，所以脚本头部的 `# rm -rf C:\Windows` 不会造成拒绝；`-WhatIf` 预览按"不会改动"放行。
+- **`[System.IO.File]::Delete`、`[IO.Directory]::Delete`、`WriteAllText`、`Clear-Content`** 原来完全看不见；现在会判，但只判引号之外的调用点（写在说明字符串里不算）。
+- **`Start-Process … -ArgumentList '/c del …'`** 把真正的命令藏在启动参数里；现在会按它要启动的命令行扫描。
+- **base64 + `Invoke-Expression`** 原来只解 `-EncodedCommand`；命令自己解码的 base64 也会被解码并扫描 —— 只解码数据、不执行的情况仍然放行。
+- **代码扫描漏了 `r"…"`、`require('fs').rmSync(…)`、`os.remove(…)`、`Path('…').unlink()`**，现在都匹配；用 raw string 的 `.py` 脚本与内联写法同判。
+- **`fsutil file createnew`** 改为按目标路径判定：系统树里拒绝，工作区里放行，而不是整条命令拒绝。
+- **`git -C <仓库> checkout .`**（以及 `reset --hard`、`filter-branch`）会识别，判决落在 `-C` 指定的仓库上。
+- **`Get-ChildItem C:\Windows -Recurse | Remove-Item`** —— 没有操作数的删除 —— 会按上一段枚举的目录判，于是管道清空系统树会被拒；同样的管道作用于工作区目录仍然放行。
+
+## 1.3.0 的修是怎么来的
+
+第三轮探测找到两条绕过路径规则的写法、一个计划任务缺口，以及一处误报。
+
+- **原始卷命名空间。** `\\?\GLOBALROOT\Device\HarddiskVolume1\Windows\…`、`\Device\HarddiskVolume2\…`、`\\.\HarddiskVolume1\…` 指向的字节与盘符完全相同，现在按原始设备判：其下的一切都是 `system`，删除和写入都算，卷影副本写法同样覆盖。
+- **`.com` 可执行文件。** `C:\Windows\System32\format.com` 才是真正的格式化程序；此前归一化只剥 `.exe`，所以 `format.com C:` 被放行。现在 `.com` 也会剥掉；`Start-Process` 不带 `-ArgumentList` 时，会把"程序 + 参数"整体当作命令行扫描，而不是只扫参数表。
+- **`schtasks /tr`。** 计划任务由系统稍后执行，不经过任何工具调用，因此在创建时就解析它的动作：`schtasks /create … /tr "cmd /c del C:\Windows\…"` 会被拒；无害动作（把 `robocopy … /MIR` 指向数据目录）仍然放行；如果动作是一个脚本，也会像其它脚本一样被读取并扫描。
+- **那处误报。** "包装器后面的破坏性动词"搜索是为了正确识别 `sudo -u bob rm -rf /usr`，但它对**所有**首词不是删除动词的命令都执行，于是 `Write-Output bcdedit /set …` 被当成真的运行了 bcdedit 而拒绝。现在只有整行仍在包装器（或其开关）内部时才继续往后找。同样的原则用于代码载荷：注释先剥掉，出现在字符串字面量里的 `fs.rmSync('…')`（测试夹具、生成器、本插件自己的测试）是数据，不是调用。
+
+
+
 ## 已知边界
 
-对 shell 的检查本质是对文本的分析，而文本是可以闪避的：由更早的变量拼出来的路径、通过 `& $path` 或 `Invoke-Expression (Get-Content …)` 间接执行的脚本、运行时下载的载荷，或内部自行解析目标的程序，都可能绕过扫描。命令**点名要执行**的脚本会被读取并扫描（1.1.0），这堵住了"先写一个 .ps1 再运行它"的两步路，但它仍然是在读文本。所以文件系统缝隙与操作系统沙箱仍在下面兜底；也正因为如此，任何保护都应当被当作其中一层，而不是唯一一层。
+对 shell 的检查本质是对文本的分析，而文本是可以闪避的：由更早的变量拼出来的路径、通过 `& $path` 或 `Invoke-Expression (Get-Content …)` 间接执行的脚本、运行时下载的载荷，或内部自行解析目标的程序，都可能绕过扫描。命令**点名要执行**的脚本会被读取并扫描（1.1.0），这堵住了"先写一个 .ps1 再运行它"的两步路，但它仍然是在读文本。计划任务的动作只在用 `schtasks /tr` 创建时被解析；用 `Register-ScheduledTask` 或程序内部的调度 API 创建的任务不在文本分析范围内。计算出来的目标是有意跳过的 —— `ForEach-Object { Remove-Item $_.FullName }` 不会被拒，因为目标不在文本里，硬猜正是 1.2.0 要去掉的那类误伤；而**直接管道**（`Get-ChildItem C:\Windows -Recurse | Remove-Item`）会被拦，因为枚举出来的目录本身就是目标。所以文件系统缝隙与操作系统沙箱仍在下面兜底；也正因为如此，任何保护都应当被当作其中一层，而不是唯一一层。
 
 参数的值只有在可能是路径时才当作路径：`New-Item -ItemType Directory` 不能凭空造出一个名叫 `Directory` 的文件，而 `Remove-Item -Path C:\Windows\System32\config` 也绝不能把真正的目标丢掉。这两个方向都有测试钉住 —— 那份跳过清单会朝两个相反的方向出错，而其中只有一种会吵闹。

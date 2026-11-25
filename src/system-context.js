@@ -110,7 +110,13 @@ export function createSystemContext(options = {}) {
     // resources directory name the install from inside the very process running
     // this plugin. Without this fallback, a machine with a clean environment had
     // no rule at all for its own application directory — measured, not theorised.
-    ...runtimeAppDirs(runtime, pathModule),
+    //
+    // Only when the context is about the host platform (or a test injected a
+    // runtime on purpose): reading `process.execPath` for a *simulated* other
+    // platform produced a nonsense install root — on Windows, `path.posix`
+    // turns `D:\DeepSeek Harness\…` into `.`, and `pathKey('.')` into `/`, which
+    // then protected every path on the simulated Linux box.
+    ...runtimeAppDirs(runtimeForInstallDirs(options, runtime, platform), pathModule),
   ].filter(Boolean)
   const installDirs = [...new Set(installCandidates.map(dir => pathKey(dir, { insensitive, path: pathModule })))]
 
@@ -198,6 +204,24 @@ export function createSystemContext(options = {}) {
 }
 
 /**
+ * The runtime whose own executable may name the install directory.
+ *
+ * A test that simulates another platform must not inherit the host's executable:
+ * the resulting path is nonsense for that platform and, once folded, can become
+ * `/` (protecting everything). An explicitly injected `runtime` is always
+ * honoured, because that is the test saying "pretend this is the process".
+ *
+ * @param {{ runtime?: object, platform?: string }} options
+ * @param {object} runtime
+ * @param {string} platform
+ * @returns {object | undefined}
+ */
+function runtimeForInstallDirs(options, runtime, platform) {
+  if (options.runtime !== undefined) return runtime
+  return platform === process.platform ? runtime : undefined
+}
+
+/**
  * The application directory of a packaged desktop app, read from the running
  * process rather than from a launcher's kindness.
  *
@@ -207,7 +231,7 @@ export function createSystemContext(options = {}) {
  * every `npm install` under it into a denial. A CLI binary carrying the
  * product's own name is the only other case worth trusting.
  *
- * @param {{ execPath?: string, resourcesPath?: string, versions?: { electron?: string } }} runtime
+ * @param {{ execPath?: string, resourcesPath?: string, versions?: { electron?: string } } | undefined} runtime
  * @returns {string[]} zero or more candidate install directories
  */
 function runtimeAppDirs(runtime, pathModule) {
@@ -220,8 +244,10 @@ function runtimeAppDirs(runtime, pathModule) {
   if (resources !== undefined) dirs.push(resources)
   // A drive root or `/` as the "install" would protect an entire volume, which
   // is a false positive of a different class than the miss this rule closes.
+  // A relative result (`.` for an executable spelled with another platform's
+  // separators) is not an install directory either.
   return [...new Set(dirs.map(dir => appRootOf(dir, pathModule)))]
-    .filter(dir => dir !== undefined && dir !== pathModule.sep && !/^[A-Za-z]:[/\\]?$/.test(dir))
+    .filter(dir => dir !== undefined && dir !== pathModule.sep && dir !== '.' && !/^[A-Za-z]:[/\\]?$/.test(dir) && pathModule.isAbsolute(dir))
 }
 
 /** Climb from an executable or a `resources` directory to the directory that *is* the install. */

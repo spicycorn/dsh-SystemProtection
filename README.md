@@ -37,7 +37,26 @@ Three independent layers enforce this:
 
 It reads *shell text*, not only file paths: `rm`, `del`, `rd`, `Remove-Item`, `mv`, `mvn`-style moves, `find -delete`, `find -exec rm`, `xargs`, redirections (`> file`, `dd of=/dev/sda`), truncation, `git` history operations, `powershell -EncodedCommand` (base64 → UTF-16LE → UTF-8), nested `bash -c` / `cmd /c` payloads, `python -c "shutil.rmtree(...)"`, `sudo`/`env`/`nice` wrappers, `cd X && rm y`, `--` separators, globs, `$env:VAR` / `${HOME}` / `%USERPROFILE%` expansion, `\\?\C:\` extended prefixes, and symlinks pointing outside the workspace. Unknown MCP tools are swept for path-shaped arguments (`path`, `file_path`, `target`, `source`, `output`, …) whenever their name says they write or delete.
 
-Version 1.1.0 answers the attacks in [`docs/system-protection-测评报告-2026-11-25.md`](docs/system-protection-测评报告-2026-11-25.md):
+Version 1.3.0 closes the third round of probing:
+
+- **Raw volume namespace is no longer a way around a drive letter.** `\\?\GLOBALROOT\Device\HarddiskVolume1\Windows\…`, `\Device\HarddiskVolume2\…` and `\\.\HarddiskVolume1\…` address the same bytes as `C:\Windows\…`; anything below a raw volume/device path is now `system` (delete **and** write).
+- **`.com` executables are normalised.** `format.com` (and any `.com` program) is the same command as `format`; `format.com C:` is denied like `format C:`, and `Start-Process` without `-ArgumentList` now scans the program and its arguments (`Start-Process format.com C:` is denied) instead of only its argument list.
+- **`schtasks /tr` is scanned.** The action of a scheduled task runs later, outside the session, so the payload is parsed now: `schtasks /create /tr "cmd /c del C:\Windows\…"` is denied when the task would destroy a protected path.
+- **One false positive removed.** A destructive command *named* in output or data no longer denies the whole line: the "mutation verb behind a wrapper" search only applies while the line is still inside a wrapper (`sudo -u bob rm …`), not when a word like `bcdedit` is merely an argument of `Write-Output` / `echo`. A code file's comments are stripped, and a call that appears inside a string literal (a test fixture, a generator, this plugin's own tests) is data, not a call.
+
+Version 1.2.0 fixed the second evaluation ([`docs/系统保护插件测评报告-2026-11-25.md`](docs/系统保护插件测评报告-2026-11-25.md)), which found one serious false positive and a set of ways around the scanner:
+
+- **The portable layout works again.** When the session workspace sits *inside* a Harness root — the shipped layout `D:\DeepSeek Harness\workspace` next to the executable — the `harness` rule now yields for targets inside the workspace, and only there. The executable, `resources`, and everything else in the install tree stay denied, the workspace root itself stays denied, and a junction planted inside the workspace cannot smuggle a target out of it.
+- **PowerShell syntax is not a path.** `$_`, `$_.FullName`, `@('a','b')`, `$(…)`, `(Get-Item x).FullName` and `{ … }` script blocks no longer become phantom operands; a variable that cannot be resolved from the command text is skipped instead of being invented as a relative file. A script's *comments* are stripped before it is scanned, so `# rm -rf C:\Windows` in a script header is not a denial, and a `-WhatIf` preview is not a deletion.
+- **`[System.IO.File]::Delete(…)`, `[IO.Directory]::Delete(…)`, `WriteAllText`, `Clear-Content`** are recognised (only outside a quoted string; a call shown in documentation stays documentation).
+- **`Start-Process cmd -ArgumentList '/c del …'`** is read as the command it launches.
+- **Base64 that is decoded and then evaluated** (`[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(…)); Invoke-Expression …`) is decoded and scanned; decoding data without evaluating it stays ordinary work.
+- **The code scanner understands `r"…"`, `b"…"`, `require('fs').rmSync(…)`, `os.remove(…)`, `Path('…').unlink()`** — the raw-string and module-returning spellings that used to slip through.
+- **`fsutil file createnew`** is judged by its path (denied in a system tree, allowed in the workspace, instead of the whole command being denied).
+- **`git -C <repo> checkout .` / `reset --hard` / `filter-branch`** are recognised, with the finding reported against the repository named by `-C`.
+- **A delete with no operand** (`Get-ChildItem C:\Windows -Recurse | Remove-Item`) removes what the previous segment enumerated, so a pipeline wipe of a system tree is caught; the same pipeline over a workspace folder stays allowed.
+
+Version 1.1.0 answered the first evaluation (1.0.0, 2026-11-25):
 
 - **The boot chain, by command rather than by path.** `bcdedit` (any mutating form), `bootrec /fixmbr` / `/fixboot` / `/rebuildbcd`, `bcdboot`, `bootsect`, `mbr2gpt`, `reagentc /disable`, `mountvol /S` and `fsutil file setzerodata` are denied by their own name and form. Read-only forms (`bcdedit /enum`, `reagentc /info`, `mountvol`) still pass.
 - **The EFI system partition is protected without a drive letter.** Slices of a volume — `\\?\Volume{…}\EFI\…`, `\EFI`, `\boot`, `\Recovery`, `\$WinREAgent`, `\System Volume Information`, an offline `\Windows\System32` — are judged on *every* volume, so `mountvol S: /S` and then `del S:\EFI\…` is still a denial.
@@ -47,6 +66,8 @@ Version 1.1.0 answers the attacks in [`docs/system-protection-测评报告-2026-
 - **Code tools are read as code.** `run_code` / `execute_code` / REPL-style tools are scanned for file-API calls (`shutil.rmtree("C:\\Windows")`, `fs.rmSync(…)`) and literal `exec("…")` commands.
 - **The guard cannot be switched off from inside the session.** `plugin_manager` and `plugin_market` stay exempt except for a call that names this plugin and disables or removes it.
 - **The plugin fails closed.** `onInternalError` now defaults to `closed`, on the tool guard and on the file-system seam.
+
+The rule the two rounds settled on: **the point is to prevent an unbootable machine, not to make ordinary work impossible.** Coverage is aimed at what is irreversible (boot chain, system tree, credentials, history), and the false-positive classes above are pinned as tests that must stay `allow`.
 
 
 ## Install
@@ -138,10 +159,12 @@ The same rule is given to the model in advance (`modelGuidance`), so the reason 
 
 - Shell inspection is text analysis. What the command assigns to its own variables **is** resolved — `$p = 'C:\…\.git\config'; Remove-Item $p` is denied, and the verdict says so in its notes — because the plugin reads the literals the command itself puts on the table. What it cannot resolve stays honestly open: a value from `Read-Host` or a prompt, a string built at runtime (`"$env:SystemRoot\x"`, `-f` formatting), `Invoke-Expression` / `& $p`, a payload downloaded and run, or a variable set by an *earlier* call. A compiled helper taking an index into a table can hide a target too.
 - A script the command *runs* is scanned (1.1.0), but only when the command names it in a form the scanner recognises: `pwsh -File x.ps1`, `bash ./x.sh`, `. .\x.ps1`, `python x.py`, `cmd /c x.bat`, or the script itself as the command. A script reached through `& $path`, `Invoke-Expression (Get-Content x)`, a downloaded payload, or a program that decides internally what to run is still outside text analysis. The file-system layer (3) and the OS sandbox stay underneath all of it.
+- Computed targets are skipped on purpose, because guessing them produced the false denials this release removes: `ForEach-Object { Remove-Item $_.FullName }` and `(Get-Item x).Delete()` stay allowed (the target is not in the text). A *direct* pipeline (`Get-ChildItem C:\Windows -Recurse | Remove-Item`) **is** caught, because there the enumeration is the target and it is in the text.
+- A scheduled task's action is parsed when it is created with `schtasks /tr`; creating one through `Register-ScheduledTask` (or a scheduler API in another program) is outside text analysis.
 - The scanner follows the shell rather than guessing intent. `Remove-Item D:\My App\file.txt`, unquoted, is two arguments to PowerShell and it deletes neither, so the plugin sees two arguments as well. Quote paths that contain spaces.
 - Wiping a filesystem root is denied in every spelling the tests can think of: `rm -rf /`, `rm -rf /*`, `rm -rf ~/*`, `Remove-Item C:\ -Recurse`, and the same hidden behind a variable. A glob inside your workspace (`rm -rf ./out/*`) is still just cleanup.
 - The application directory is protected as `harness`. It comes from `DSH_INSTALL_DIR` / `DSH_NODE_EXECUTABLE` when the launcher exports them, and otherwise from the running process itself (a packaged desktop app knows its own executable and `resources` directory). Two edges are left open on purpose: a plain `node` process never makes its own tree the install — that would deny every `npm install` under it — and an app installed *directly on a drive root* is not inferred, because protecting a whole volume by accident is worse than the miss it trades. Both cases are one `protectExtra` line.
-- A harness root that **contains** the session workspace yields to it. If you point a session at the Harness install, `~/.dsh`, or the profile directory, the plugin assumes you mean to work there; `system`, `credentials`, and `versionControl` never yield, so such a session still cannot delete `C:\Windows`.
+- A harness root and the session workspace relate in either direction, and both are handled. If the workspace **contains** a harness root (a `link:` install you are editing), the harness rule yields for that tree. If a harness root **contains** the workspace (the portable layout, `…\DeepSeek Harness\workspace`), the rule yields only for targets inside the workspace: the executable, `resources`, the profile, and everything else stay denied, the workspace root itself stays denied, and a junction inside the workspace is resolved so it cannot point back into the install tree. `system`, `credentials`, and `versionControl` never yield, so such a session still cannot delete `C:\Windows`.
 - The guard is one layer of defence. Keep `danger-full-access` off unless a task needs it, keep backups, and keep `git` clean.
 - `allowExtra` is absolute: it exists so that "yes, really delete that" is one config line, not a code change.
 - Because `~/.dsh` and the active profile directory are in the `harness` tier, a tool call that tries to edit Harness's own state or patch file is denied. That is deliberate — the model should not be rewriting the harness config behind your back — but if you *want* it to, name the exact file: `allowExtra: ["~/.dsh/profiles/desktop/cordis.patch.yml"]`.
@@ -172,18 +195,18 @@ The guard is synchronous and cheap, and `test/perf.mjs` keeps it that way (measu
 
 | Input | Cost | Verdict |
 | --- | --- | --- |
-| `rm -rf ./build && echo done` | 0.6 ms | allow |
-| 20 000 chained segments, all safe | 462 ms | allow |
-| 1 MB of benign command text | 530 ms | allow |
-| 20 000 chained segments, one of them hostile | 92 ms | deny |
-| 60 nested `bash -c`, hostile target inside | 0.7 ms | deny |
+| `rm -rf ./build && echo done` | 0.7 ms | allow |
+| 20 000 chained segments, all safe | 496 ms | allow |
+| 1 MB of benign command text | 540 ms | allow |
+| 20 000 chained segments, one of them hostile | 84 ms | deny |
+| 60 nested `bash -c`, hostile target inside | 0.8 ms | deny |
 
 Cost is linear in the size of the argument, and scanning stops at the first operand that reaches a `deny` tier — the verdict cannot get stricter after that. A megabyte-long single command is half a second, which a shell launch swallows anyway.
 
 ## Development
 
 ```bash
-npm test          # 175 decision checks + 44 wiring + 18 no-touch + 10 performance + 13 packaging checks
+npm test          # 240 decision checks + 44 wiring + 18 no-touch + 10 performance + 13 packaging checks
 ```
 
 - `test/selftest.mjs` — simulated Windows and Linux machines, no install, no network.

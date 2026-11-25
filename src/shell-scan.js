@@ -17,7 +17,7 @@
  * @module system-protection/shell-scan
  */
 
-import { escapesNext, expandVariables, isWildcardOperand, isWithin, normalizeAbsolute, pathKey, resolveExistingPath, stripQuotes } from './paths.js'
+import { escapesNext, expandVariables, isAbsoluteLike, isWildcardOperand, isWithin, normalizeAbsolute, pathKey, resolveExistingPath, stripQuotes } from './paths.js'
 import { classifyKey, TIER_RANK } from './rules.js'
 
 /** Prefix commands that only change how the real command runs. */
@@ -35,12 +35,20 @@ const POSIX_CODE = new Map([['python', '-c'], ['python2', '-c'], ['python3', '-c
 /** PowerShell / cmd deletion verbs (compared lower-cased). */
 const WIN_DELETE = new Set(['del', 'erase', 'rd', 'rmdir', 'rm', 'ri', 'remove-item', 'remove-psdrive', 'del.exe', 'rd.exe', 'rm.exe', 'erase.exe', 'remove-item.exe'])
 const WIN_MOVE = new Set(['move-item', 'move', 'mv', 'mi', 'ren', 'rename-item', 'rn', 'move-item.exe'])
-const WIN_WRITE = new Set(['set-content', 'sc', 'out-file', 'add-content', 'ac', 'new-item', 'ni'])
+const WIN_WRITE = new Set(['set-content', 'sc', 'out-file', 'add-content', 'ac', 'new-item', 'ni', 'clear-content', 'clc'])
 const WIN_CODE = new Map([['pwsh', ['-command', '-c', '-e']], ['powershell', ['-command', '-c', '-e']], ['powershell_ise', []], ['pwsh.exe', ['-command', '-c', '-e']], ['powershell.exe', ['-command', '-c', '-e']]])
 /** `-EncodedCommand` aliases, and the script-block forms. */
 const ENCODED_FLAGS = new Set(['-encodedcommand', '-enc'])
 /** A `.ps1`/`.bat` run through a shell needs no extra work: the file is data. */
 const CMD_WRAPPERS = new Set(['cmd', 'cmd.exe'])
+
+/**
+ * Commands whose *arguments* are a command line of their own. Their payload is
+ * extracted by `nestedPayloads` and scanned as a command; the outer segment must
+ * not also look for a destructive verb inside those arguments, or
+ * `cmd /c echo bcdedit /set …` is read as if it ran `bcdedit`.
+ */
+const SHELL_HOSTS = new Set([...POSIX_SHELLS, 'cmd', ...WIN_CODE.keys()])
 
 /** Commands that damage the machine whatever their arguments name. */
 const BLANKET = [
@@ -115,6 +123,9 @@ const SYSTEM_COMMANDS = [
     note: 'fsutil can overwrite the contents of a file or damage a volume\'s metadata',
     danger: args => /(?:^|\s)(?:setzerodata|setvaliddata|deletejournal|dismount)(?:\s|$)/.test(commandLine(args))
       || /(?:^|\s)dirty\s+set(?:\s|$)/.test(commandLine(args)),
+    // `fsutil file createnew <path> <size>` only creates a file: judge its path
+    // against the rules instead of denying the command outright.
+    writeOnly: args => /(?:^|\s)createnew(?:\s|$)/.test(commandLine(args)),
     classifyPaths: true,
   },
 ]
@@ -150,12 +161,51 @@ const MAX_CODE_DEPTH = 2
 /** A cheap pre-test before tokenizing a segment for script references. */
 const SCRIPT_EXT_HINT = /\.(?:ps1|psm1|psd1|bat|cmd|sh|bash|zsh|ksh|dash|py|pyw|js|mjs|cjs|rb|pl|vbs|wsf)\b/i
 
-/** Direct file-API calls inside embedded code payloads. */
-const CODE_DELETE_RE = /(?:fs\.(?:rm|rmSync|unlink|unlinkSync|remove|rmdir|rmdirSync|rimraf)(?:Sync)?|fs\.promises\.(?:rm|unlink|rmdir)|os\.(?:remove|unlink|rmdir)|shutil\.rmtree|send2trash\.send2trash|pathlib\.rmtree|Path\([^)]*\)\.unlink)\s*\(\s*(['"`])([^'"`]+)\1/g
+/** A string literal prefix Python and JavaScript allow before the quote: `r"…"`, `b"…"`, `u"…"`, `f"…"`. */
+const LITERAL_PREFIX = String.raw`[rRbBuUfF]{0,2}`
+
+/**
+ * A deletion through Node's `fs`, including the module-returning spelling
+ * `require('fs').rmSync(…)` that a bare `fs.` pattern missed.
+ */
+const CODE_FS_DELETE_RE = new RegExp(
+  String.raw`(?:require\(\s*['"](?:node:)?fs['"]\s*\)|fs)(?:\.promises)?\.(?:rm|rmSync|unlink|unlinkSync|rmdir|rmdirSync|remove|rimraf)\s*\(\s*`
+  + LITERAL_PREFIX
+  + String.raw`(['"\`])([^'"\`]+)\1`,
+  'g',
+)
+
+/** A deletion through a Python / POSIX file API, with or without a string prefix. */
+const CODE_API_DELETE_RE = new RegExp(
+  String.raw`(?:shutil\.rmtree|os\.remove|os\.unlink|os\.rmdir|send2trash\.send2trash|pathlib\.rmtree)\s*\(\s*`
+  + LITERAL_PREFIX
+  + String.raw`(['"\`])([^'"\`]+)\1`,
+  'g',
+)
+
+/** `pathlib.Path('/etc').unlink()` on a literal path. */
+const CODE_PATHLIB_DELETE_RE = new RegExp(
+  String.raw`Path\(\s*`
+  + LITERAL_PREFIX
+  + String.raw`(['"\`])([^'"\`]+)\1`
+  + String.raw`\s*\)\.unlink\s*\(`,
+  'g',
+)
 
 /** A literal command handed to a process API inside a code payload. */
 const CODE_EXEC_RE = /(?:execSync|exec|spawnSync|spawn|execFileSync|execFile|system|popen|check_output|run)\s*\(\s*(['"`])([^'"`\n]{2,400})\1/g
 
+/**
+ * .NET file APIs invoked from PowerShell: `[System.IO.File]::Delete('…')`,
+ * `[IO.Directory]::Delete('…', $true)`, `[System.IO.File]::WriteAllText(…)`.
+ * The keyword is the class name, not the script text, so only a call site
+ * outside a quoted string is judged (`Write-Host '[IO.File]::Delete(…)'` is
+ * documentation, not a call).
+ */
+const DOTNET_FILE_API_RE = /\[(?:System\.)?IO\.(File|Directory)\]::(Delete|WriteAllText|WriteAllLines|WriteAllBytes|AppendAllText|AppendAllLines|Create|CreateText|OpenWrite|Replace|Move|Copy)\s*\(\s*(['"])([^'"]+)\3/g
+
+/** A quoted base64 blob in a command that also evaluates text (`iex`). */
+const BASE64_LITERAL_RE = /(['"])([A-Za-z0-9+/]{16,}={0,2})\1/g
 
 /**
  * Flags whose value is a separate token that must not be read as a path.
@@ -185,23 +235,43 @@ function isNoise(token) {
   if (token === undefined || token === null) return true
   const text = String(token)
   if (text === '' || text === '--' || text === ';' || text === '\\;' || text === '+' || text === '(' || text === ')') return true
-  if (text === '!' || text === '{}' || text === '{};' || text === ';&' || text === ';;') return true
+  if (text === '!' || text === '{}' || text === '{};' || text === ';&' || text === ';;' || text === ',' || text === '|') return true
   if (/^\d+$/.test(text)) return true
   if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(text)) return true
   if (/^&[<>]?/.test(text)) return true
+  // PowerShell expressions, not paths: `@('a','b')`, `@{…}`, `$(Get-Item x)`,
+  // `(Get-Item x).FullName`, `{ … }` script blocks. Plain variables (`$HOME`,
+  // `$env:SystemRoot\…`) are *not* skipped: they are expanded first, and a
+  // variable that could not be expanded is dropped later only when its value
+  // cannot be known (`$_.FullName`, `$p` assigned by an earlier call).
+  if (text.startsWith('@') || text.startsWith('$(') || text.startsWith('(') || text.startsWith('{')) return true
   return false
 }
 
 /**
  * Split a command line into command segments at unquoted control operators.
+ *
+ * With `detailed`, each result also says whether the segment is fed by a single
+ * `|` — the difference between `dir C:\Windows ; Remove-Item $x` (two unrelated
+ * commands) and `dir C:\Windows | Remove-Item` (one pipeline whose target is the
+ * listing), which the delete-with-no-operand inference must not conflate.
+ *
  * @param {string} text
  * @param {string} dialect `sh` | `ps` | `cmd`
- * @returns {string[]}
+ * @param {boolean} [detailed]
+ * @returns {Array<string | { text: string, pipe: boolean }>}
  */
-export function splitSegments(text, dialect) {
+export function splitSegments(text, dialect, detailed = false) {
   const segments = []
   let current = ''
   let quote = ''
+  let piped = false
+  const push = () => {
+    const value = current.trim()
+    if (value !== '') segments.push(detailed ? { text: value, pipe: piped } : value)
+    current = ''
+    piped = false
+  }
   const chars = [...text]
   for (let index = 0; index < chars.length; index++) {
     const char = chars[index]
@@ -245,20 +315,41 @@ export function splitSegments(text, dialect) {
     }
     const pair = `${char}${next ?? ''}`
     if (pair === '&&' || pair === '||' || (dialect === 'sh' && pair === '|&')) {
-      segments.push(current)
-      current = ''
+      push()
       index++
       continue
     }
     if (char === ';' || char === '\n' || char === '|' || (dialect !== 'ps' && char === '&') || char === '\r') {
-      segments.push(current)
-      current = ''
+      const singlePipe = char === '|'
+      push()
+      piped = singlePipe
       continue
     }
     current += char
   }
-  segments.push(current)
-  return segments.map(segment => segment.trim()).filter(segment => segment !== '')
+  push()
+  return segments
+}
+
+/**
+ * Is the character at `index` inside a quoted string of the command text?
+ * A literal `[IO.File]::Delete(…)` inside a string is documentation; outside it
+ * is a call.
+ * @param {string} text
+ * @param {number} index
+ */
+function isInsideQuotes(text, index) {
+  let quote = ''
+  for (let i = 0; i < index; i++) {
+    const char = text[i]
+    if (quote !== '') {
+      if (char === '`' || char === '\\') { i += 1; continue }
+      if (char === quote) quote = ''
+      continue
+    }
+    if (char === '"' || char === "'") quote = char
+  }
+  return quote !== ''
 }
 
 /**
@@ -381,6 +472,32 @@ function decodeEncoded(value) {
   }
 }
 
+/**
+ * Decode a base64 blob whose encoding the command itself chose
+ * (`[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(…))`).
+ * UTF-8 is tried first because that is what such a command usually means; a
+ * UTF-16LE payload (the `-EncodedCommand` shape) fails the UTF-8 check on its
+ * NUL bytes and falls through.
+ */
+function decodeBase64Text(value) {
+  const text = String(value).trim()
+  if (text === '' || !/^[A-Za-z0-9+/]+={0,2}$/.test(text)) return undefined
+  try {
+    const bytes = Buffer.from(text, 'base64')
+    if (bytes.length === 0) return undefined
+    const utf8 = bytes.toString('utf8')
+    if (utf8.length > 0 && !utf8.includes('\uFFFD') && !utf8.includes('\0')) return { text: utf8, encoding: 'utf8' }
+    if (bytes.length % 2 === 0) {
+      const utf16 = bytes.toString('utf16le')
+      if (utf16.length > 0 && !utf16.includes('\0')) return { text: utf16, encoding: 'utf16le' }
+    }
+    return undefined
+  }
+  catch {
+    return undefined
+  }
+}
+
 /** Derive the shell dialect from a tool or shell name. */
 export function dialectFor(name) {
   const lower = String(name ?? '').toLowerCase()
@@ -397,15 +514,30 @@ function gatherTexts(command, dialect, limit = 24) {
   const out = [{ text: command, dialect, via: 'command' }]
   const queue = [...out]
   const seen = new Set([command])
+  const addPayload = (nested, parent) => {
+    if (nested.text === '' || seen.has(nested.text) || out.length >= limit) return
+    seen.add(nested.text)
+    const item = { ...nested, via: `${parent.via}>${nested.via}` }
+    out.push(item)
+    queue.push(item)
+  }
   while (queue.length > 0 && out.length < limit) {
     const entry = queue.shift()
     for (const segment of splitSegments(entry.text, entry.dialect)) {
       for (const nested of nestedPayloads(segment, entry.dialect)) {
         if (seen.has(nested.text)) continue
-        seen.add(nested.text)
-        const item = { ...nested, via: `${entry.via}>${nested.via}` }
-        out.push(item)
-        queue.push(item)
+        addPayload(nested, entry)
+      }
+    }
+    // A command that decodes base64 and then evaluates it is a shell in two
+    // steps: `$c = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(…));
+    // Invoke-Expression $c`. The blob and the `iex` need not be in the same
+    // segment, so the whole entry is checked. A command that only *decodes* data
+    // is left alone.
+    if (/(?:^|[\s;|&`])iex(?:[\s;|&`]|$)|invoke-expression/i.test(entry.text)) {
+      for (const match of entry.text.matchAll(BASE64_LITERAL_RE)) {
+        const decoded = decodeBase64Text(match[2])
+        if (decoded !== undefined) addPayload({ text: decoded.text, dialect: 'ps', via: `base64:${decoded.encoding}` }, entry)
       }
     }
   }
@@ -431,18 +563,24 @@ function nestedPayloads(segment, dialect) {
   const codeFlags = POSIX_CODE.get(verb)
   if (verb === 'find' || verb === 'xargs' || verb === 'ssh') return payloads
   if (POSIX_SHELLS.has(verb) || CMD_WRAPPERS.has(verb)) {
-    for (let i = index + 1; i < tokens.length; i++) {
+    // Backwards: the innermost payload (`bash -c bash -c … "rm -rf /"`) is the
+    // one that matters, and the scan budget is finite.
+    for (let i = tokens.length - 1; i > index; i--) {
       const token = tokens[i]
       const flag = token.text.toLowerCase()
       if (flag === '-c' || flag === '/c' || flag === '/k' || flag === '-command') {
         const value = tokens[i + 1]
-        if (value !== undefined && !value.redirection) pushPayload(value.raw, verb === 'cmd' || verb === 'cmd.exe' ? 'cmd' : 'sh', flag)
+        if (value === undefined || value.redirection) continue
+        // A quoted payload is one token; an unquoted one spreads over the rest
+        // of the line (`cmd /c del C:\Windows\…`), so take the remainder there.
+        const candidate = value.quoted ? value.raw : tokens.slice(i + 1).map(item => item.raw).join(' ')
+        pushPayload(candidate, verb === 'cmd' || verb === 'cmd.exe' ? 'cmd' : 'sh', flag)
       }
     }
   }
   const winFlags = WIN_CODE.get(verb)
   if (winFlags !== undefined) {
-    for (let i = index + 1; i < tokens.length; i++) {
+    for (let i = tokens.length - 1; i > index; i--) {
       const token = tokens[i]
       const flag = token.text.toLowerCase()
       if (winFlags.includes(flag)) {
@@ -464,6 +602,44 @@ function nestedPayloads(segment, dialect) {
       if (tokens[i].text.toLowerCase() === codeFlags) pushPayload(tokens[i + 1]?.raw ?? '', 'sh', codeFlags)
     }
   }
+  // `Start-Process cmd -ArgumentList '/c del …'`: the destructive command is an
+  // argument of a launcher, not the first word of the line. The argument list is
+  // rebuilt (quotes and commas removed) and scanned as a command line of its own.
+  // Without `-ArgumentList`, the rest of the line is the command and its arguments
+  // (`Start-Process format.com C:`), so it is scanned the same way.
+  if (verb === 'start-process' || verb === 'start') {
+    const rest = tokens.slice(index + 1)
+    const flagIndex = rest.findIndex(token => /^-(?:argumentlist|args)$/i.test(token.text))
+    let parts
+    if (flagIndex >= 0) {
+      // The program being launched is as important as its arguments:
+      // `Start-Process bcdedit -ArgumentList '/delete …'`.
+      const program = rest.slice(0, flagIndex).find(token => !isSwitchToken(token.text, dialect))
+      parts = [...(program === undefined ? [] : [program]), ...rest.slice(flagIndex + 1)]
+    }
+    else {
+      // Without `-ArgumentList`, the rest of the line is the command itself.
+      parts = rest
+    }
+    if (parts.length > 0) {
+      const text = parts.map(token => token.raw).join(' ').replace(/['"]/g, '').replace(/\s*,\s*/g, ' ')
+      pushPayload(text, 'cmd', flagIndex >= 0 ? '-ArgumentList' : 'positional')
+    }
+  }
+  // `schtasks /create … /tr "cmd /c del …"`: the task action runs later, outside
+  // this session, so it is scanned now or never.
+  if (verb === 'schtasks' || verb === 'schtasks.exe') {
+    for (let i = index + 1; i < tokens.length; i++) {
+      if (tokens[i].text.toLowerCase() !== '/tr') continue
+      const value = tokens[i + 1]
+      if (value === undefined || value.redirection) continue
+      const candidate = value.quoted ? value.raw : tokens.slice(i + 1).map(item => item.raw).join(' ')
+      pushPayload(candidate, 'cmd', '/tr')
+    }
+  }
+  // A command that evaluates a string it decoded itself is handled once for the
+  // whole command line in `gatherTexts`, because the blob and the `iex` often
+  // live in different segments.
   return payloads
 }
 
@@ -473,7 +649,7 @@ function isWrapper(token, dialect) {
   return /^[A-Za-z_][A-Za-z0-9_]*=/.test(token)
 }
 
-/** Basename of a command word, lower-cased, without a `.exe` suffix. */
+/** Basename of a command word, lower-cased, without an executable suffix. */
 function normalizeVerb(word, dialect) {
   let text = String(word ?? '').trim()
   if (text === '') return ''
@@ -481,9 +657,49 @@ function normalizeVerb(word, dialect) {
   const index = Math.max(text.lastIndexOf('/'), text.lastIndexOf('\\'))
   if (index >= 0) text = text.slice(index + 1)
   text = text.toLowerCase()
-  if (dialect === 'ps' || dialect === 'cmd') text = text.replace(/\.(exe|cmd|bat|ps1)$/, '')
-  else text = text.replace(/\.exe$/, '')
+  // `.com` matters: `C:\Windows\System32\format.com` is the real format program.
+  if (dialect === 'ps' || dialect === 'cmd') text = text.replace(/\.(exe|com|cmd|bat|ps1)$/, '')
+  else text = text.replace(/\.(exe|com)$/, '')
   return text
+}
+
+/** Read-only commands that enumerate a directory tree. */
+const ENUMERATION_VERBS = new Set(['get-childitem', 'gci', 'dir', 'ls', 'get-item', 'gi', 'tree', 'dir.exe', 'ls.exe'])
+
+/**
+ * What a segment is, for the one inference the text allows: a delete with no
+ * operand of its own (`… | Remove-Item`) removes what the previous segment
+ * enumerated. `Get-ChildItem C:\Windows -Recurse | Remove-Item -Force` is a
+ * complete wipe spelled without a single delete operand.
+ *
+ * @param {string} segment
+ * @param {string} dialect
+ * @returns {{ enumeration?: { path: string, recursive: boolean }, bareDelete?: boolean }}
+ */
+function segmentSummary(segment, dialect) {
+  if (!/\b(?:remove-item|rm|del|erase|rd|rmdir|unlink|get-childitem|gci|dir|ls|get-item|gi|tree)\b/i.test(segment)) return {}
+  const tokens = tokenize(segment, dialect)
+  let index = 0
+  while (index < tokens.length && isWrapper(tokens[index].text, dialect)) index++
+  const verb = normalizeVerb(tokens[index]?.text ?? '', dialect)
+  const rest = tokens.slice(index + 1).filter(token => token.redirection !== true)
+  if (ENUMERATION_VERBS.has(verb)) {
+    const target = rest.find(token => !isSwitchToken(token.text, dialect) && !isNoise(token.text))
+    if (target === undefined) return {}
+    return {
+      enumeration: {
+        path: target.text,
+        recursive: rest.some(token => /^-(?:recurse|r)$|^\/s$/i.test(token.text)),
+      },
+    }
+  }
+  if (POSIX_DELETE.has(verb) || WIN_DELETE.has(verb)) {
+    const hasOperand = rest.some(token => !isSwitchToken(token.text, dialect) && !isNoise(token.text))
+    // A preview changes nothing, so it is not a pipeline whose target is unknown.
+    if (dialect === 'ps' && !/\.exe$/i.test(stripQuotes(tokens[index]?.text ?? '')) && rest.some(token => token.text.toLowerCase() === '-whatif')) return {}
+    return hasOperand ? {} : { bareDelete: true }
+  }
+  return {}
 }
 
 /**
@@ -584,7 +800,9 @@ export function scanCommand(options) {
       }))
       return
     }
-    if (texts.length < MAX_SCAN_TEXTS) texts.push({ text, dialect: scriptDialect, via: `script:${absolute}` })
+    // A comment that mentions a destructive command is still a comment.
+    const body = stripLineComments(text, scriptDialect)
+    if (texts.length < MAX_SCAN_TEXTS && body.trim() !== '') texts.push({ text: body, dialect: scriptDialect, via: `script:${absolute}` })
   }
 
   for (let entryIndex = 0; entryIndex < texts.length; entryIndex++) {
@@ -593,10 +811,31 @@ export function scanCommand(options) {
     let runningCwd = cwd
     /** Literals this command assigned to its own variables, in source order. */
     const vars = new Map()
-    for (const source of splitSegments(entry.text, entry.dialect)) {
-      const segment = expandAssigned(source, vars, entry.dialect, notes)
+    /** What the previous segment enumerated, for `… | Remove-Item` (no operand). */
+    let enumerated
+    for (const source of splitSegments(entry.text, entry.dialect, true)) {
+      const segment = expandAssigned(source.text, vars, entry.dialect, notes)
       recordAssignment(segment, vars, entry.dialect)
       scanSegment({ segment, dialect: entry.dialect, cwd: runningCwd, ctx, sessionRoot, findings, notes, fs: options.fs, resolveSymlinksInsideWorkspace: options.resolveSymlinksInsideWorkspace, protectWrites })
+      // A delete that names nothing removes what the previous segment listed —
+      // but only across a real pipe: `dir X ; Remove-Item $later` is two
+      // unrelated commands and must not be welded together.
+      const summary = segmentSummary(segment, entry.dialect)
+      if (summary.bareDelete === true && enumerated !== undefined && source.pipe === true) {
+        findings.push(...classifyOperand({
+          raw: enumerated.path,
+          cwd: runningCwd,
+          ctx,
+          sessionRoot,
+          verb: 'pipeline-delete',
+          via: 'pipeline',
+          fs: options.fs,
+          resolveSymlinksInsideWorkspace: options.resolveSymlinksInsideWorkspace,
+          recursive: enumerated.recursive,
+          op: 'delete',
+        }))
+      }
+      enumerated = summary.enumeration
       for (const reference of scriptReferences(segment, entry.dialect)) loadScript(reference, runningCwd)
       // `cd /etc && rm passwd` — relative operands after a cd are resolved there.
       const moved = cdTarget(segment, entry.dialect, runningCwd, ctx)
@@ -604,16 +843,21 @@ export function scanCommand(options) {
       if (stopped()) return { findings: dedupe(findings), notes }
     }
     // Direct file APIs and literal process-exec strings inside a code payload.
-    findings.push(...scanCodePayload({
-      code: entry.text,
-      cwd: runningCwd,
-      ctx,
-      sessionRoot,
-      fs: options.fs,
-      resolveSymlinksInsideWorkspace: options.resolveSymlinksInsideWorkspace,
-      protectWrites,
-      depth,
-    }))
+    // Only a payload that *is* code is checked this way: a plain command line
+    // that merely prints a code snippet (`echo "fs.rmSync(…)"`) is not running
+    // it, and treating it as a deletion was a false positive.
+    if (entry.via !== 'command') {
+      findings.push(...scanCodePayload({
+        code: entry.text,
+        cwd: runningCwd,
+        ctx,
+        sessionRoot,
+        fs: options.fs,
+        resolveSymlinksInsideWorkspace: options.resolveSymlinksInsideWorkspace,
+        protectWrites,
+        depth,
+      }))
+    }
     if (stopped()) return { findings: dedupe(findings), notes }
   }
   return { findings: dedupe(findings), notes }
@@ -685,6 +929,58 @@ function scriptReferences(segment, dialect) {
 }
 
 /**
+ * Remove comments from program source before looking for file-API calls.
+ *
+ * A test fixture, a generator, or this plugin's own tests contain strings such as
+ * `"fs.rmSync('C:/Windows/…')"`. Those are data, not calls: scanning them denied
+ * running the test file, which is exactly the false-positive class this release
+ * is meant to remove. Comments are not code either.
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+function stripCodeComments(text) {
+  const out = []
+  let quote = ''
+  for (let index = 0; index < text.length; index++) {
+    const char = text[index]
+    if (quote !== '') {
+      out.push(char)
+      if ((char === '\\' || char === '`') && index + 1 < text.length) {
+        out.push(text[++index])
+        continue
+      }
+      if (char === quote) quote = ''
+      continue
+    }
+    if (char === '"' || char === "'" || char === '`') {
+      quote = char
+      out.push(char)
+      continue
+    }
+    if (char === '/' && text[index + 1] === '/') {
+      while (index < text.length && text[index] !== '\n') index++
+      out.push('\n')
+      continue
+    }
+    if (char === '/' && text[index + 1] === '*') {
+      index += 2
+      while (index < text.length && !(text[index] === '*' && text[index + 1] === '/')) index++
+      index += 1
+      out.push(' ')
+      continue
+    }
+    if (char === '#') {
+      while (index < text.length && text[index] !== '\n') index++
+      out.push('\n')
+      continue
+    }
+    out.push(char)
+  }
+  return out.join('')
+}
+
+/**
  * Scan the source of a `run_code`-style call (or a program file a shell ran)
  * for file APIs and literal commands.
  *
@@ -706,6 +1002,10 @@ export function scanCodePayload(options) {
   const findings = []
   if (typeof code !== 'string' || code === '') return findings
   const depth = Number.isFinite(options.depth) ? options.depth : 0
+  // Comments and string literals are data: a fixture that *contains* the text
+  // `fs.rmSync('C:/Windows/…')` must not be denied for it. Only a call site in
+  // code position — outside a quote and outside a comment — is executed code.
+  const source = stripCodeComments(code)
   const shared = {
     cwd,
     ctx,
@@ -714,14 +1014,21 @@ export function scanCodePayload(options) {
     resolveSymlinksInsideWorkspace: options.resolveSymlinksInsideWorkspace,
     op: 'delete',
   }
-  for (const match of code.matchAll(CODE_DELETE_RE)) {
-    findings.push(...classifyOperand({ ...shared, raw: match[2], verb: match[1], via: 'code-api' }))
+  const collect = (pattern, verb) => {
+    for (const match of source.matchAll(pattern)) {
+      if (isInsideQuotes(source, match.index ?? 0)) continue
+      findings.push(...classifyOperand({ ...shared, raw: match[2], verb, via: 'code-api' }))
+    }
   }
+  collect(CODE_FS_DELETE_RE, 'fs-delete')
+  collect(CODE_API_DELETE_RE, 'api-delete')
+  collect(CODE_PATHLIB_DELETE_RE, 'pathlib-delete')
   if (depth < MAX_CODE_DEPTH) {
     // A cheap linear pre-test: a megabyte of ordinary command text must not pay
     // for a second full regex pass that cannot match.
-    if (/\b(?:exec|spawn|system|popen|check_output|run)\s*\(/.test(code)) {
-      for (const match of code.matchAll(CODE_EXEC_RE)) {
+    if (/\b(?:exec|spawn|system|popen|check_output|run)\s*\(/.test(source)) {
+      for (const match of source.matchAll(CODE_EXEC_RE)) {
+        if (isInsideQuotes(source, match.index ?? 0)) continue
         const command = match[2]
         if (command === undefined || command.trim() === '') continue
         const scanned = scanCommand({
@@ -741,6 +1048,54 @@ export function scanCodePayload(options) {
     }
   }
   return findings
+}
+
+/**
+ * Remove comments from a shell script before scanning it.
+ *
+ * A script that *documents* a destructive command ("# never run rm -rf /")
+ * must not be denied for the comment. Only script text goes through this: on a
+ * typed command line a `#` is more likely to be part of the command.
+ *
+ * @param {string} text
+ * @param {string} dialect
+ * @returns {string}
+ */
+function stripLineComments(text, dialect) {
+  if (dialect === 'cmd') {
+    return String(text).split(/\r?\n/).map(line => (/^\s*(?:rem(?:\s|$)|::)/i.test(line) ? '' : line)).join('\n')
+  }
+  const out = []
+  let quote = ''
+  for (let index = 0; index < text.length; index++) {
+    const char = text[index]
+    if (quote !== '') {
+      out.push(char)
+      if ((char === '`' || char === '\\') && index + 1 < text.length) {
+        out.push(text[++index])
+        continue
+      }
+      if (char === quote) quote = ''
+      continue
+    }
+    if (char === '"' || char === "'") {
+      quote = char
+      out.push(char)
+      continue
+    }
+    if (char === '#') {
+      const previous = index > 0 ? text[index - 1] : ''
+      // PowerShell starts a comment at any unquoted `#`; POSIX shells only at a
+      // word boundary (`$#` and `${#x}` are not comments).
+      if (dialect === 'ps' || previous === '' || /[\s;&|(]/.test(previous)) {
+        while (index < text.length && text[index] !== '\n') index++
+        out.push('\n')
+        continue
+      }
+    }
+    out.push(char)
+  }
+  return out.join('')
 }
 
 /**
@@ -905,14 +1260,49 @@ function expandAssigned(segment, vars, dialect, notes) {
 function scanSegment({ segment, dialect, cwd, ctx, sessionRoot, findings, notes, fs, resolveSymlinksInsideWorkspace, protectWrites }) {
   const tokens = tokenize(segment, dialect)
   if (tokens.length === 0) return
+
+  // .NET file APIs invoked straight from PowerShell: no shell verb, one line,
+  // any path. Only a call site outside a quoted string is judged, so a script
+  // that *documents* `[IO.File]::Delete(…)` is not denied for it.
+  if (segment.includes('IO.')) {
+    for (const match of segment.matchAll(DOTNET_FILE_API_RE)) {
+      if (isInsideQuotes(segment, match.index ?? 0)) continue
+      const method = match[2].toLowerCase()
+      findings.push(...classifyOperand({
+        raw: match[4],
+        cwd,
+        ctx,
+        sessionRoot,
+        verb: `io.${match[1].toLowerCase()}.${method}`,
+        via: 'dotnet-api',
+        fs,
+        resolveSymlinksInsideWorkspace,
+        op: method === 'delete' ? 'delete' : 'overwrite',
+      }))
+    }
+  }
   let index = 0
-  while (index < tokens.length && isWrapper(tokens[index].text, dialect)) index++
+  /** A command wrapper (`sudo`, `env`, `nice`, …) was skipped, so a verb may follow. */
+  let wrapperSeen = false
+  while (index < tokens.length) {
+    const text = tokens[index].text
+    if (WRAPPERS.has(normalizeVerb(text, dialect))) {
+      wrapperSeen = true
+      index++
+      continue
+    }
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(text)) { index++; continue }
+    break
+  }
   let verbToken = tokens[index]
   if (verbToken === undefined) return
   let verb = normalizeVerb(verbToken.text, dialect)
+  const shellHost = SHELL_HOSTS.has(verb)
   // `sudo -u bob rm -rf /usr`: the mutation verb hides behind wrapper arguments,
-  // so look further along the line unless the leader only reads.
-  if (!isMutationVerb(verb) && !READ_ONLY_VERBS.has(verb)) {
+  // so look further along the line — but only while the leader is a wrapper (or
+  // one of its switches). A real command's own arguments are not commands:
+  // `Write-Output bcdedit /set …` must never be read as running bcdedit.
+  if (!shellHost && (wrapperSeen || verbToken.text.startsWith('-')) && !isMutationVerb(verb) && !READ_ONLY_VERBS.has(verb)) {
     for (let j = index + 1; j < tokens.length; j++) {
       if (tokens[j].quoted === true || tokens[j].redirection === true) continue
       const candidate = normalizeVerb(tokens[j].text, dialect)
@@ -928,6 +1318,14 @@ function scanSegment({ segment, dialect, cwd, ctx, sessionRoot, findings, notes,
   }
   const args = tokens.slice(index + 1)
   const argTexts = args.map(token => token.text.toLowerCase())
+  // `-WhatIf` is a promise from the PowerShell engine that nothing is changed;
+  // previewing a destructive command must not be denied as if it ran. A native
+  // `.exe` (cmd's own `del.exe`) has no such switch, so it is never exempted.
+  const nativeCommand = /\.exe$/i.test(stripQuotes(verbToken.text))
+  if (dialect === 'ps' && !nativeCommand && argTexts.includes('-whatif')
+    && (WIN_DELETE.has(verb) || WIN_MOVE.has(verb) || WIN_WRITE.has(verb) || POSIX_DELETE.has(verb))) {
+    return
+  }
   // A user may name a command as allowed (`allowCommands: [mountvol]`) because a
   // form-only finding has no path for `allowExtra` to match.
   const verbAllowed = Array.isArray(ctx.allowCommands) && ctx.allowCommands.includes(verb)
@@ -951,6 +1349,15 @@ function scanSegment({ segment, dialect, cwd, ctx, sessionRoot, findings, notes,
         if (token.redirection === true || isSwitchToken(token.text, dialect) || isNoise(token.text) || token.text.includes('=')) continue
         findings.push(...classifyOperand({ raw: token.text, alt: token.raw, cwd, ctx, sessionRoot, verb, via: 'operand', fs, resolveSymlinksInsideWorkspace, op: 'overwrite' }))
       }
+    }
+    return
+  }
+  // A write-only form of the same command: `fsutil file createnew <path> <size>`
+  // is not a machine-damaging invocation by itself, so only its path is judged.
+  if (systemCommand !== undefined && !verbAllowed && systemCommand.writeOnly?.(argTexts) === true) {
+    for (const token of args) {
+      if (token.redirection === true || isSwitchToken(token.text, dialect) || isNoise(token.text) || token.text.includes('=')) continue
+      findings.push(...classifyOperand({ raw: token.text, alt: token.raw, cwd, ctx, sessionRoot, verb, via: 'operand', fs, resolveSymlinksInsideWorkspace, op: 'overwrite' }))
     }
     return
   }
@@ -1018,8 +1425,48 @@ function scanSegment({ segment, dialect, cwd, ctx, sessionRoot, findings, notes,
   }
 
   if (verb === 'git') {
-    const sub = normalizeVerb(args[0]?.text ?? '', dialect)
-    const flags = args.map(token => token.text.toLowerCase())
+    // Global options come before the subcommand and may change the repository:
+    // `git -C D:\projects\app checkout .` was not recognised at all, because the
+    // subcommand was read as `-C`.
+    let cursor = 0
+    let repoBase = cwd
+    const globalValue = new Set(['--git-dir', '--work-tree', '--namespace', '--exec-path', '--config-env'])
+    while (cursor < args.length) {
+      const token = args[cursor].text
+      const lower = token.toLowerCase()
+      if (token === '--') { cursor += 1; continue }
+      if (token === '-C') {
+        // Git's `-C` is case-sensitive; `-c` sets a config value.
+        const value = args[cursor + 1]?.text
+        cursor += 2
+        if (value !== undefined) {
+          const expanded = expandVariables(stripQuotes(value), ctx)
+          const absolute = normalizeAbsolute(expanded.text, ctx, cwd)
+          if (absolute !== undefined) repoBase = absolute
+        }
+        continue
+      }
+      if (lower === '-c') { cursor += 2; continue }
+      const eq = lower.indexOf('=')
+      const head = eq > 0 ? lower.slice(0, eq) : lower
+      if (globalValue.has(head)) {
+        const value = eq > 0 ? token.slice(eq + 1) : args[cursor + 1]?.text
+        cursor += eq > 0 ? 1 : 2
+        // `--work-tree=<dir>` names the tree the command works on; the finding
+        // should be reported against that tree, not the shell's cwd.
+        if ((head === '--work-tree' || head === '--git-dir') && value !== undefined) {
+          const expanded = expandVariables(stripQuotes(value), ctx)
+          const absolute = normalizeAbsolute(expanded.text, ctx, cwd)
+          if (absolute !== undefined) repoBase = absolute
+        }
+        continue
+      }
+      if (token.startsWith('-')) { cursor += 1; continue }
+      break
+    }
+    const sub = normalizeVerb(args[cursor]?.text ?? '', dialect)
+    const rest = args.slice(cursor + 1)
+    const flags = rest.map(token => token.text.toLowerCase())
     // Rewriting history or pruning the object store destroys work the user
     // cannot get back without a backup: the strict tier.
     const rewritesHistory = sub === 'filter-branch' || sub === 'filter-repo'
@@ -1027,17 +1474,17 @@ function scanSegment({ segment, dialect, cwd, ctx, sessionRoot, findings, notes,
       || (sub === 'reflog' && flags.includes('--expire=now'))
       || (sub === 'prune' && flags.includes('--expire-objects'))
     if (rewritesHistory) {
-      findings.push({ tier: 'versionControl', id: `shell:git-${sub}`, verb: `git ${sub}`, path: cwd, raw: `git ${sub}`, note: `git ${sub} rewrites or prunes repository history` })
+      findings.push({ tier: 'versionControl', id: `shell:git-${sub}`, verb: `git ${sub}`, path: repoBase, raw: `git ${sub}`, note: `git ${sub} rewrites or prunes repository history` })
       return
     }
     // Discarding the working tree loses uncommitted edits: worth a confirmation,
     // not a block, because it is a normal thing to ask an agent to do.
     const discardsWork = sub === 'clean' || sub === 'stash' && flags.includes('clear')
       || (sub === 'reset' && flags.includes('--hard'))
-      || (sub === 'checkout' && (flags.includes('--') || args.some(token => token.text === '.')))
-      || (sub === 'restore' && (flags.includes('--worktree') || flags.includes('.')))
+      || (sub === 'checkout' && (flags.includes('--') || rest.some(token => token.text === '.')))
+      || (sub === 'restore' && (flags.includes('--worktree') || rest.some(token => token.text === '.')))
     if (discardsWork) {
-      findings.push({ tier: 'uncommittedWork', id: `shell:git-${sub}`, verb: `git ${sub}`, path: cwd, raw: `git ${sub}`, note: `git ${sub} discards uncommitted files` })
+      findings.push({ tier: 'uncommittedWork', id: `shell:git-${sub}`, verb: `git ${sub}`, path: repoBase, raw: `git ${sub}`, note: `git ${sub} discards uncommitted files` })
     }
     return
   }
@@ -1157,6 +1604,11 @@ function classifyOperand({ raw, alt, cwd, ctx, sessionRoot, verb, via, fs, resol
     const original = stripQuotes(spelling)
     if (original === '' || isNoise(original)) continue
     const expanded = expandVariables(original, ctx)
+    // A variable this command never assigned is not a path; treating `$p` as one
+    // invents a relative file and can deny a perfectly ordinary command. An
+    // absolute spelling keeps its protection even with a stray `$` in it
+    // (`C:\$Recycle.Bin`, `C:\$WinREAgent`).
+    if (expanded.unresolved.length > 0 && !isAbsoluteLike(original, ctx)) continue
     const absolute = normalizeAbsolute(expanded.text, ctx, cwd)
     if (absolute === undefined) continue
 

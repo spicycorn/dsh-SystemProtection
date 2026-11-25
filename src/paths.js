@@ -376,6 +376,53 @@ export function depthBelow(parentKey, childKey, ctx) {
 }
 
 /**
+ * Resolve the deepest ancestor of a path that exists, then re-append the rest.
+ *
+ * A target that does not exist yet (a new file, a probe) is still reached
+ * *through* whatever the existing part of its path is: a junction inside the
+ * workspace pointing at the Harness install must not turn "write a new file in
+ * the workspace" into "write a new file in `resources`".
+ *
+ * @param {string} absolute
+ * @param {{ path: typeof import('node:path'), insensitive: boolean }} ctx
+ * @param {Partial<typeof import('node:fs')> | undefined} fsx
+ * @returns {string | undefined} the real path, only when it differs from the spelling
+ */
+export function resolveExistingAncestor(absolute, ctx, fsx) {
+  const realpath = nativeRealpath(fsx)
+  if (realpath === undefined || typeof fsx?.existsSync !== 'function') return undefined
+  const original = String(absolute)
+  if (original === '') return undefined
+  let cursor = original
+  const remainder = []
+  for (let guard = 0; guard < 64; guard++) {
+    let exists = false
+    try {
+      exists = fsx.existsSync(cursor) === true
+    }
+    catch {
+      exists = false
+    }
+    if (exists) {
+      try {
+        const real = realpath(cursor)
+        if (typeof real !== 'string' || real === '') return undefined
+        const target = remainder.length === 0 ? real : joinRaw(real, remainder.join(ctx.path.sep))
+        return pathKey(target, ctx) === pathKey(original, ctx) ? undefined : target
+      }
+      catch {
+        return undefined
+      }
+    }
+    const parent = ctx.path.dirname(cursor)
+    if (parent === cursor || parent === '' || parent === '.' || parent === ctx.path.sep) return undefined
+    remainder.unshift(ctx.path.basename(cursor))
+    cursor = parent
+  }
+  return undefined
+}
+
+/**
  * Resolve an *existing* path through the OS, including junctions, mount points
  * and 8.3 short names, and report it only when it differs from the spelling.
  *

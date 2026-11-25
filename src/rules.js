@@ -12,7 +12,7 @@
  * @module system-protection/rules
  */
 
-import { canonicalAlias, depthBelow, isVolumeOrRoot, isWithin, pathKey, uncLocalAlias } from './paths.js'
+import { canonicalAlias, depthBelow, isVolumeOrRoot, isWithin, pathKey, resolveExistingAncestor, uncLocalAlias } from './paths.js'
 
 /** Every tier the plugin can enforce, in the order the manual lists them. */
 export const TIERS = Object.freeze([
@@ -115,6 +115,26 @@ const BOOT_DIR_LEAVES = new Map([
   ['$winreagent', 'system:winreagent'],
   ['system volume information', 'system:volume-information'],
 ])
+
+/** Raw volume / device names, precompiled for the classification hot path. */
+const RAW_DEVICE = String.raw`(?:harddisk(?:volume(?:shadowcopy)?)?\d+|physicaldrive\d+|cdrom\d+|tape\d+)`
+const RAW_DEVICE_RE = new RegExp(String.raw`^\\*(?:globalroot\\)?device\\${RAW_DEVICE}(?:\\|$)`)
+const RAW_DEVICE_BARE_RE = new RegExp(String.raw`^\\*${RAW_DEVICE}(?:\\|$)`)
+
+/**
+ * Does this key name a raw volume / device namespace?
+ *
+ * `\\?\GLOBALROOT\Device\HarddiskVolume1\Windows\…` and `\Device\HarddiskVolume2\…`
+ * address the same bytes as a drive letter, without one. After `pathKey` they
+ * arrive as `globalroot\device\harddiskvolume1\…`, `device\harddiskvolume1\…`,
+ * or `harddiskvolume1\…` (the `\\.\` form), so all spellings are matched.
+ *
+ * @param {string} probe comparable path key
+ * @returns {boolean}
+ */
+function rawDeviceHit(probe) {
+  return RAW_DEVICE_RE.test(probe) || RAW_DEVICE_BARE_RE.test(probe)
+}
 
 /**
  * Does this path name a machine-booting structure at the root of a volume?
@@ -338,10 +358,11 @@ export function classifyKey(input, ctx, extra = {}) {
     if (allowed(probe)) return { tier: 'allow', id: 'allowExtra', key: probe }
 
     if (isVolumeOrRoot(probe, ctx)) return { tier: 'system', id: 'system:volume-root', key: probe }
-    // `\\.\PhysicalDrive0` loses its prefix above and arrives as `physicaldrive0`.
-    if (/^(?:physicaldrive\d+|harddisk\d+)$/.test(probe) || probe.startsWith('device\\harddisk')) {
-      return { tier: 'system', id: 'system:device', key: probe }
-    }
+    // Raw volume and device namespaces reach the same bytes without a drive
+    // letter: `\\?\GLOBALROOT\Device\HarddiskVolume1\Windows\…`,
+    // `\Device\HarddiskVolume2\…`, `\\.\PhysicalDrive0`. They are the whole
+    // volume, so anything below them is the operating system's own storage.
+    if (ctx.win && rawDeviceHit(probe)) return { tier: 'system', id: 'system:device', key: probe }
     if (ctx.roots.home !== '' && (probe === ctx.roots.home || probe === `${ctx.roots.home}${ctx.win ? '\\' : '/'}`)) {
       return { tier: 'homeRoot', id: 'home:root', key: probe }
     }
@@ -362,15 +383,30 @@ export function classifyKey(input, ctx, extra = {}) {
     // a file that happens to be named like one.
     for (const rule of table) {
       // `harness:self` exists so a model cannot delete the protection plugin to
-      // switch itself off. When the plugin *is* inside the session workspace — a
-      // `link:` install someone is developing — that same rule would deny every
-      // ordinary edit in the tree, so the developer's own tree wins. The same
-      // principle covers every harness root, the application directory included:
-      // a person who chose a workspace containing the Harness, `~/.dsh`, or the
-      // profile means to work there, and no rule of this plugin can talk them out
-      // of it. `system`, `credentials`, and `versionControl` never yield — a
-      // workspace that happens to contain `C:\Windows` still cannot delete it.
-      if (rule.id.startsWith('harness:') && sessionRoot !== undefined && isWithin(sessionRoot, rule.key, ctx)) continue
+      // switch itself off. Two layouts have to keep working, and the plugin must
+      // not trade one for the other:
+      //
+      //  1. the Harness root (the plugin included) sits *inside* the workspace —
+      //     a `link:` install someone is developing. Every ordinary edit in the
+      //     tree is workspace work, so the harness rule yields.
+      //  2. the workspace sits *inside* a Harness root — the portable layout
+      //     where `workspace` lives next to the application executable. There,
+      //     the rule yields only for a target that is genuinely inside the
+      //     workspace; the executable, `resources`, and everything else stay
+      //     denied. Without this, the default portable layout cannot write a
+      //     single file, which is not protection, it is breakage.
+      //
+      // A junction planted inside the workspace must not smuggle the target out
+      // of it, so the deepest existing ancestor is resolved before yielding.
+      if (rule.id.startsWith('harness:') && sessionRoot !== undefined) {
+        const harnessInsideWorkspace = isWithin(sessionRoot, rule.key, ctx)
+        const workspaceInsideHarness = isWithin(rule.key, sessionRoot, ctx)
+        if (harnessInsideWorkspace) continue
+        if (workspaceInsideHarness && isWithin(sessionRoot, probe, ctx)) {
+          const realProbe = extra.fs === undefined ? undefined : resolveExistingAncestor(probe, ctx, extra.fs)
+          if (realProbe === undefined || isWithin(sessionRoot, pathKey(realProbe, ctx), ctx)) continue
+        }
+      }
       if (rule.except !== undefined && rule.except.some(exceptKey => isWithin(exceptKey, probe, ctx))) continue
       const depth = depthBelow(rule.key, probe, ctx)
       if (depth < 0) continue

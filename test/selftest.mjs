@@ -675,6 +675,290 @@ const mountvolAllowed = decideToolCall({
 assert.equal(mountvolAllowed.action, 'allow', `allowCommands: ${JSON.stringify(mountvolAllowed.hits)}`)
 passed += 1
 
+// ── 1.2.0: the second evaluation (workspace inside the install root) ────────
+// The portable layout puts `workspace` next to the application executable. Every
+// write there used to be judged `harness:install` — the plugin refused to produce
+// any file at all, which is breakage, not protection.
+const nestedCtx = createSystemContext({
+  platform: 'win32',
+  homedir: 'C:\\Users\\tester',
+  cwd: 'D:\\DeepSeek Harness\\workspace',
+  env: {
+    SystemRoot: 'C:\\Windows',
+    USERPROFILE: 'C:\\Users\\tester',
+    DSH_INSTALL_DIR: 'D:\\DeepSeek Harness',
+    DSH_NODE_EXECUTABLE: 'D:\\DeepSeek Harness\\DeepSeek Harness.exe',
+    DSH_PROFILE_DIR: 'C:\\Users\\tester\\.dsh\\profiles\\desktop',
+  },
+})
+const nestedFs = virtualFs({
+  'd:\\': { dir: true },
+  'd:\\deepseek harness': { dir: true },
+  'd:\\deepseek harness\\workspace': { dir: true },
+  'd:\\deepseek harness\\resources': { dir: true },
+  // A junction planted inside the workspace, pointing at the install tree.
+  'd:\\deepseek harness\\workspace\\link': { dir: true, alias: 'D:\\DeepSeek Harness\\resources' },
+})
+const decideNested = (name, args) => decideToolCall({
+  name,
+  args: typeof args === 'string' ? { command: args } : args,
+  ctx: nestedCtx,
+  sessionRoot: nestedCtx.cwd,
+  fs: nestedFs,
+  tierActions: DEFAULT_TIERS,
+  protectWrites: true,
+  scanShell: true,
+  scanScripts: true,
+  genericPathSweep: true,
+  resolveSymlinksInsideWorkspace: false,
+})
+
+for (const [label, name, args, expect, tier] of [
+  ['write inside the portable workspace', 'write', { file_path: 'D:\\DeepSeek Harness\\workspace\\probe.txt', content: 'x' }, 'allow'],
+  ['delete inside the portable workspace', 'pwsh', "Remove-Item -Recurse -Force 'D:\\DeepSeek Harness\\workspace\\probe'", 'allow'],
+  ['write the application executable', 'write', { file_path: 'D:\\DeepSeek Harness\\DeepSeek Harness.exe', content: 'x' }, 'deny', 'harness'],
+  ['write resources', 'write', { file_path: 'D:\\DeepSeek Harness\\resources\\app.asar', content: 'x' }, 'deny', 'harness'],
+  ['delete the workspace root itself', 'pwsh', "Remove-Item -Recurse -Force 'D:\\DeepSeek Harness\\workspace'", 'deny', 'workspaceRoot'],
+  ['delete the install root', 'pwsh', "Remove-Item -Recurse -Force 'D:\\DeepSeek Harness'", 'deny'],
+  ['junction out of the workspace', 'write', { file_path: 'D:\\DeepSeek Harness\\workspace\\link\\new.txt', content: 'x' }, 'deny', 'harness'],
+]) {
+  const verdict = decideNested(name, args)
+  if (verdict.action !== expect || (tier !== undefined && !verdict.hits.some(hit => hit.tier === tier))) {
+    failures.push(`nested layout ${label}: expected ${expect}${tier === undefined ? '' : ` ${tier}`}, got ${verdict.action} ${JSON.stringify(verdict.hits)}`)
+  }
+  else passed += 1
+}
+
+// A context that merely *simulates* another platform must not inherit the host
+// executable: doing so turned the simulated Linux install root into `/` and made
+// the bundled suites fail on a Desktop runtime. An explicit runtime still wins.
+const simulatedNix = createSystemContext({ platform: 'linux', homedir: '/home/dev', cwd: '/home/dev/work/app', env: { HOME: '/home/dev' } })
+if (process.platform === 'win32') assert.deepEqual(simulatedNix.roots.installDirs, [], `simulated linux installDirs: ${JSON.stringify(simulatedNix.roots.installDirs)}`)
+assert.deepEqual(createSystemContext({ platform: 'linux', homedir: '/home/dev', cwd: '/home/dev/work/app', env: { HOME: '/home/dev' }, runtime: { execPath: '/opt/DeepSeek Harness/resources/app', resourcesPath: '/opt/DeepSeek Harness/resources', versions: { electron: '33' } } }).roots.installDirs.includes('/opt/DeepSeek Harness'), true)
+passed += 2
+
+// ── 1.2.0: false positives found while producing that report ────────────────
+// PowerShell expressions are not paths. These all delete or read workspace
+// content and must run; none of them hides a protected target.
+for (const [label, command] of [
+  ['pipeline variable', "Get-ChildItem -Recurse | Where-Object { $_.Name -like '*.tmp' } | Remove-Item"],
+  ['array literal', "Remove-Item -Recurse -Force @('build','dist')"],
+  ['parenthesised expression', 'Remove-Item (Get-Item .\\build).FullName'],
+  ['computed path with a variable', 'Get-ChildItem .\\out | Remove-Item -Force'],
+  ['a code snippet that is only printed', 'echo "fs.rmSync(\'C:/Windows/System32/x.dll\')"'],
+  ['a -WhatIf preview of a delete', 'Remove-Item -Recurse -Force C:\\Windows -WhatIf'],
+  ['a -WhatIf preview of a pipeline', 'Get-ChildItem C:\\Windows -Recurse | Remove-Item -WhatIf'],
+]) {
+  const verdict = decideReport('pwsh', command)
+  if (verdict.action !== 'allow') failures.push(`false positive ${label}: expected allow, got ${verdict.action} ${JSON.stringify(verdict.hits)}`)
+  else passed += 1
+}
+
+// A harmless .ps1 whose body only *names* things must not be denied.
+const harmlessFs = virtualFs({
+  'c:\\': { dir: true },
+  'c:\\windows': { dir: true },
+  'c:\\windows\\system32': { dir: true },
+  'c:\\projects\\demo': { dir: true },
+  'c:\\projects\\demo\\cleanup.ps1': {
+    text: "# rm -rf C:\\Windows\\System32\n# del C:\\Windows\\System32\\config\nWrite-Output 'workspace file'\nCopy-Item 'workspace file' 'copy of workspace file'\n",
+  },
+})
+toolCall({ platform: 'win32', ctx: reportCtx, fs: harmlessFs, name: 'pwsh', args: shell('pwsh -File C:\\projects\\demo\\cleanup.ps1'), action: 'allow' })
+
+// ── 1.2.0: bypasses from the second report ─────────────────────────────────
+for (const [label, command, expect, tier] of [
+  // .NET file APIs are shell verbs in disguise.
+  ['dotnet delete', "[System.IO.File]::Delete('C:\\Windows\\System32\\__dsh_sp_probe_nonexistent__.dll')", 'deny', 'system'],
+  ['dotnet directory delete', "[System.IO.Directory]::Delete('C:\\Windows\\System32', $true)", 'deny', 'system'],
+  ['dotnet write', "[System.IO.File]::WriteAllText('C:\\Windows\\__dsh_sp_probe_nonexistent__.txt', 'x')", 'deny', 'system'],
+  ['dotnet short class name', "[IO.File]::Delete('C:\\Windows\\System32\\__dsh_sp_probe_nonexistent__.dll')", 'deny', 'system'],
+  // The same call in a documentation string is not a call.
+  ['dotnet documented in a string', "Write-Host '[System.IO.File]::Delete(\"C:\\Windows\\x.dll\")'", 'allow'],
+  // Clear-Content empties a file without deleting it.
+  ['clear-content system file', 'Clear-Content C:\\Windows\\System32\\drivers\\etc\\hosts', 'deny', 'system'],
+  ['clear-content workspace file', 'Clear-Content .\\out\\notes.txt', 'allow'],
+  // Start-Process hides the real command in -ArgumentList.
+  ['start-process cmd', "Start-Process cmd -ArgumentList '/c del C:\\Windows\\System32\\__dsh_sp_probe_nonexistent__.dll'", 'deny', 'system'],
+  ['start-process harmless', "Start-Process notepad -ArgumentList 'C:\\Windows\\win.ini'", 'allow'],
+  // Raw-string prefixes and require('fs') hid the target from the code scanner.
+  ['python raw string', "python -c \"import shutil; shutil.rmtree(r'C:/Windows/System32/config')\"", 'deny', 'system'],
+  ['node require fs', "node -e \"require('fs').rmSync('C:/Windows/System32/__dsh_sp_probe_nonexistent__.dll')\"", 'deny', 'system'],
+  ['fsutil createnew', 'fsutil file createnew C:\\Windows\\System32\\__dsh_sp_probe_nonexistent__ 1024', 'deny', 'system'],
+  ['fsutil createnew workspace', 'fsutil file createnew .\\out\\data.bin 1024', 'allow'],
+]) {
+  const verdict = decideReport('pwsh', command)
+  if (verdict.action !== expect || (tier !== undefined && !verdict.hits.some(hit => hit.tier === tier))) {
+    failures.push(`${label}: expected ${expect}${tier === undefined ? '' : ` ${tier}`}, got ${verdict.action} ${JSON.stringify(verdict.hits)}`)
+  }
+  else passed += 1
+}
+
+// A .py whose content uses a raw string is still a deletion.
+const evilPy = virtualFs({
+  'c:\\': { dir: true },
+  'c:\\windows': { dir: true },
+  'c:\\windows\\system32': { dir: true },
+  'c:\\projects\\demo': { dir: true },
+  'c:\\projects\\demo\\evil.py': { text: "import shutil\nshutil.rmtree(r'C:/Windows/System32/config')\n" },
+})
+toolCall({ platform: 'win32', ctx: reportCtx, fs: evilPy, name: 'python', args: { code: 'print(1)' }, action: 'allow' })
+const pyScript = decideToolCall({
+  name: 'pwsh',
+  args: shell('python C:\\projects\\demo\\evil.py'),
+  ctx: reportCtx,
+  sessionRoot: WIN_CWD,
+  fs: evilPy,
+  tierActions: DEFAULT_TIERS,
+  protectWrites: true,
+  scanShell: true,
+  scanScripts: true,
+  genericPathSweep: true,
+  resolveSymlinksInsideWorkspace: false,
+})
+assert.equal(pyScript.action, 'deny', `raw-string script target: ${JSON.stringify(pyScript.hits)}`)
+passed += 1
+
+// `git -C <repo> …` names the repository before the subcommand.
+for (const [command, expect, tier] of [
+  ['git -C D:\\projects\\app checkout .', 'ask', 'uncommittedWork'],
+  ['git -C D:\\projects\\app reset --hard', 'ask', 'uncommittedWork'],
+  ['git -C D:\\projects\\app filter-branch --prune-empty', 'deny', 'versionControl'],
+  ['git -C D:\\projects\\app status', 'allow'],
+]) {
+  const verdict = decideReport('pwsh', command)
+  if (verdict.action !== expect || (tier !== undefined && !verdict.hits.some(hit => hit.tier === tier))) {
+    failures.push(`git -C ${command}: expected ${expect}, got ${verdict.action} ${JSON.stringify(verdict.hits)}`)
+  }
+  else passed += 1
+}
+
+// A command that decodes base64 and evaluates it is a shell in two steps.
+const hidden = Buffer.from('Remove-Item -Recurse -Force C:\\Windows\\System32\\config', 'utf8').toString('base64')
+toolCall({
+  platform: 'win32',
+  ctx: reportCtx,
+  fs: reportFs,
+  name: 'pwsh',
+  args: shell(`$c=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${hidden}')); Invoke-Expression $c`),
+  action: 'deny',
+  tier: 'system',
+})
+// …but decoding data without evaluating it stays ordinary work.
+assert.equal(decideReport('pwsh', `$bytes = [Convert]::FromBase64String('${hidden}')`).action, 'allow')
+passed += 1
+
+// …but the switch is not a bypass: cmd's own del.exe has no -WhatIf.
+toolCall({ platform: 'win32', ctx: reportCtx, fs: reportFs, name: 'pwsh', args: shell('del.exe C:\\Windows\\System32\\config\\SAM -WhatIf'), action: 'deny', tier: 'system' })
+toolCall({ platform: 'win32', ctx: reportCtx, fs: reportFs, name: 'pwsh', args: shell('cmd /c "del C:\\Windows\\System32\\config\\SAM -WhatIf"'), action: 'deny', tier: 'system' })
+
+// A delete with no operand removes what the previous segment listed.
+for (const [label, command, expect, tier] of [
+  ['pipeline wipe of the system tree', 'Get-ChildItem C:\\Windows -Recurse | Remove-Item -Force', 'deny', 'system'],
+  ['pipeline wipe of a workspace folder', 'Get-ChildItem .\\out -Recurse | Remove-Item -Force', 'allow'],
+  ['pipeline into a formatter', 'Get-ChildItem C:\\Windows | Select-Object Name', 'allow'],
+  ['adjacent but unrelated commands', 'dir C:\\Windows; Remove-Item $later', 'allow'],
+]) {
+  const verdict = decideReport('pwsh', command)
+  if (verdict.action !== expect || (tier !== undefined && !verdict.hits.some(hit => hit.tier === tier))) {
+    failures.push(`${label}: expected ${expect}, got ${verdict.action} ${JSON.stringify(verdict.hits)}`)
+  }
+  else passed += 1
+}
+
+// ── 1.3.0: raw device namespace, format.com, schtasks, and one false positive ─
+// R1: `\\?\GLOBALROOT\Device\HarddiskVolumeN\…` addresses the same bytes as a
+// drive letter, without one.
+for (const [label, name, args] of [
+  ['globalroot delete', 'pwsh', shell('del "\\\\?\\GLOBALROOT\\Device\\HarddiskVolume1\\Windows\\System32\\drivers\\etc\\hosts"')],
+  ['globalroot write', 'write', { file_path: '\\\\?\\GLOBALROOT\\Device\\HarddiskVolume1\\Windows\\__dsh_sp_probe_nonexistent__.txt', content: 'x' }],
+  ['device delete', 'pwsh', shell('del \\Device\\HarddiskVolume2\\Windows\\System32\\config\\SAM')],
+  ['drive-device delete', 'pwsh', shell('del \\\\.\\HarddiskVolume1\\Windows\\System32\\config\\SAM')],
+  ['shadow copy delete', 'pwsh', shell('del "\\\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy1\\Windows\\System32\\config\\SAM"')],
+]) {
+  const decision = decideToolCall({
+    name,
+    args,
+    ctx: reportCtx,
+    sessionRoot: WIN_CWD,
+    fs: reportFs,
+    tierActions: DEFAULT_TIERS,
+    protectWrites: true,
+    scanShell: true,
+    scanScripts: true,
+    genericPathSweep: true,
+    resolveSymlinksInsideWorkspace: false,
+  })
+  if (decision.action !== 'deny' || !decision.hits.some(hit => hit.tier === 'system')) {
+    failures.push(`R1 ${label}: expected deny system, got ${decision.action} ${JSON.stringify(decision.hits)}`)
+  }
+  else passed += 1
+}
+
+// R2: format.com is the real format program.
+for (const [label, command] of [
+  ['format.com', 'format.com C:'],
+  ['format.exe', 'format.exe C:'],
+  ['system32 format.com', 'C:\\Windows\\System32\\format.com C:'],
+  ['format.com behind Start-Process', 'Start-Process format.com C:'],
+]) {
+  const decision = decideReport('pwsh', command)
+  if (decision.action !== 'deny' || !decision.hits.some(hit => hit.tier === 'system')) {
+    failures.push(`R2 ${label}: expected deny system, got ${decision.action} ${JSON.stringify(decision.hits)}`)
+  }
+  else passed += 1
+}
+
+// R3: the action of a scheduled task runs later, so its payload is scanned now.
+for (const [label, command, expect, tier] of [
+  ['schtasks quoted action', 'schtasks /create /tn probe /tr "cmd /c del C:\\Windows\\System32\\drivers\\etc\\hosts" /sc once /st 23:59', 'deny', 'system'],
+  ['schtasks unquoted action', 'schtasks /create /tn probe /tr cmd /c del C:\\Windows\\System32\\config\\SAM /sc once', 'deny', 'system'],
+  ['schtasks benign query', 'schtasks /query /tn probe', 'allow'],
+  ['schtasks benign action', 'schtasks /create /tn backup /tr "cmd /c robocopy C:\\src D:\\backup /MIR" /sc daily', 'allow'],
+  ['schtasks action is a hostile script', 'schtasks /create /tn probe /tr "C:\\work\\cleanup.ps1" /sc once', 'deny', 'system'],
+]) {
+  const decision = decideReport('pwsh', command)
+  if (decision.action !== expect || (tier !== undefined && !decision.hits.some(hit => hit.tier === tier))) {
+    failures.push(`R3 ${label}: expected ${expect}${tier === undefined ? '' : ` ${tier}`}, got ${decision.action} ${JSON.stringify(decision.hits)}`)
+  }
+  else passed += 1
+}
+
+// False positive: a dangerous command *named* in output or in a file is not run.
+for (const [label, command] of [
+  ['bcdedit named in Write-Output', 'Write-Output "bcdedit /delete {current} /f"'],
+  ['bcdedit named in a file value', "Set-Content -Path .\\notes.txt -Value 'bcdedit /delete {current} /f'"],
+  ['bcdedit named in cmd /c echo', 'cmd /c echo bcdedit /set foo'],
+]) {
+  const decision = decideReport('pwsh', command)
+  if (decision.action !== 'allow') failures.push(`false positive ${label}: expected allow, got ${decision.action} ${JSON.stringify(decision.hits)}`)
+  else passed += 1
+}
+// …while an actual bcdedit call is still denied.
+toolCall({ platform: 'win32', ctx: reportCtx, fs: reportFs, name: 'pwsh', args: shell('cmd /c bcdedit /delete {current} /f'), action: 'deny', tier: 'system' })
+// A launched program that merely mentions a protected file is not a deletion.
+assert.equal(decideReport('pwsh', 'Start-Process notepad C:\\Windows\\win.ini').action, 'allow')
+passed += 1
+
+// A test fixture that contains those strings is data, not a call.
+const fixtureFs = virtualFs({
+  'c:\\': { dir: true },
+  'c:\\windows': { dir: true },
+  'c:\\windows\\system32': { dir: true },
+  'c:\\projects\\demo': { dir: true },
+  'c:\\projects\\demo\\fixture.mjs': {
+    text: [
+      "const sample = \"shutil.rmtree('C:/Windows/System32/config')\"",
+      "// never do fs.rmSync('C:/Windows/System32/x.dll')",
+      "const execSample = 'exec(\"del C:/Windows/x\")'",
+      'export default sample',
+    ].join('\n'),
+  },
+  'c:\\projects\\demo\\real.mjs': { text: "import fs from 'node:fs'\nfs.rmSync('C:/Windows/System32/x.dll')\n" },
+})
+toolCall({ platform: 'win32', ctx: reportCtx, fs: fixtureFs, name: 'pwsh', args: shell('node C:\\projects\\demo\\fixture.mjs'), action: 'allow' })
+toolCall({ platform: 'win32', ctx: reportCtx, fs: fixtureFs, name: 'pwsh', args: shell('node C:\\projects\\demo\\real.mjs'), action: 'deny', tier: 'system' })
+
 console.log(`system-protection selftest: ${passed} checks passed, ${failures.length} failed`)
 for (const failure of failures) console.error(`FAIL ${failure}`)
 if (failures.length > 0) process.exitCode = 1
